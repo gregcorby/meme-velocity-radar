@@ -150,9 +150,15 @@
   body {
     @apply bg-background font-sans text-foreground antialiased;
     overflow: hidden;
+    width: 100%;
     font-feature-settings:
       "kern" 1,
       "ss01" 1;
+  }
+
+  #root {
+    max-width: 100%;
+    overflow-x: hidden;
   }
 
   button,
@@ -271,21 +277,54 @@
 @media (max-width: 1023px) {
   body {
     overflow: auto;
+    overflow-x: hidden;
   }
 
   .dashboard-shell {
     display: block;
+    width: 100%;
+    max-width: 100vw;
     height: auto;
     min-height: 100dvh;
     overflow: visible;
+    overflow-x: hidden;
   }
 
   .sidebar-panel {
+    width: 100%;
+    max-width: 100vw;
     border-right: 0;
     border-bottom: 1px solid hsl(var(--border));
   }
 
   .main-panel {
+    width: 100%;
+    max-width: 100vw;
     overflow: visible;
+    overflow-x: hidden;
+  }
+
+  [data-testid="token-list"] {
+    width: 100%;
+    max-width: calc(100vw - 2.5rem);
+  }
+}
+
+@media (max-width: 640px) {
+  [data-radix-toast-viewport] {
+    width: 100vw !important;
+    max-width: 100vw !important;
+  }
+
+  [data-testid="snapshot-bar"] {
+    grid-template-columns: 1fr;
+  }
+
+  [data-testid^="button-token-"] {
+    max-width: 100%;
+  }
+
+  [data-testid^="button-token-"] .grid {
+    min-width: 0;
   }
 }

@@ -57,10 +57,11 @@ type DexMeta = {
 };
 
 const DEX = "https://api.dexscreener.com";
-const CACHE_MS = 12_000;
-const REFRESH_SECONDS = 15;
-const MAX_CANDIDATES = 42;
+const CACHE_MS = 25_000;
+const REFRESH_SECONDS = 20;
+const MAX_CANDIDATES = 14;
 let memoryCache: { expires: number; snapshot: RadarSnapshot } | null = null;
+let lastGoodSnapshot: RadarSnapshot | null = null;
 
 function clamp(value: number, min = 0, max = 100) {
   if (!Number.isFinite(value)) return min;
@@ -392,7 +393,12 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
     }
   });
 
-  const candidates = Array.from(profileByAddress.keys()).slice(0, MAX_CANDIDATES);
+  const prioritizedCandidates = [
+    ...boosts.filter((profile) => profile.chainId === "solana").map((profile) => profile.tokenAddress).filter(Boolean),
+    ...updates.filter((profile) => profile.chainId === "solana").map((profile) => profile.tokenAddress).filter(Boolean),
+    ...profiles.filter((profile) => profile.chainId === "solana").map((profile) => profile.tokenAddress).filter(Boolean),
+  ] as string[];
+  const candidates = Array.from(new Set(prioritizedCandidates)).slice(0, MAX_CANDIDATES);
   const pairResults = await mapPool(candidates, 7, async (address) => {
     const result = await fetchJson<DexPair[]>(`/token-pairs/v1/solana/${address}`, `pairs:${address}`, 6_000);
     if (!result.ok) {
@@ -425,7 +431,22 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
     tokens,
   };
 
+  if (!snapshot.tokens.length && (candidates.length === 0 || sourceHealth.some((source) => source.status === "error"))) {
+    const fallback = await latestUsableSnapshot();
+    if (fallback) {
+      fallback.sourceHealth = [
+        { name: "stale-while-rate-limited", status: "degraded", detail: "serving last non-empty scan while public feeds recover" },
+        ...sourceHealth,
+      ];
+      fallback.generatedAt = new Date().toISOString();
+      fallback.latencyMs = Date.now() - started;
+      memoryCache = { expires: Date.now() + CACHE_MS, snapshot: fallback };
+      return fallback;
+    }
+  }
+
   memoryCache = { expires: Date.now() + CACHE_MS, snapshot };
+  if (snapshot.tokens.length) lastGoodSnapshot = snapshot;
   storage
     .saveRadarSnapshot({
       capturedAt: snapshot.generatedAt,
@@ -433,6 +454,18 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
     })
     .catch(() => undefined);
   return snapshot;
+}
+
+async function latestUsableSnapshot(): Promise<RadarSnapshot | null> {
+  if (lastGoodSnapshot?.tokens.length) return structuredClone(lastGoodSnapshot);
+  const latest = await storage.getLatestRadarSnapshot().catch(() => undefined);
+  if (!latest) return null;
+  try {
+    const parsed = JSON.parse(latest.payload) as RadarSnapshot;
+    return parsed.tokens?.length ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
