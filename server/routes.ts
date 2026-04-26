@@ -2,6 +2,16 @@ import type { Express } from "express";
 import type { Server } from "node:http";
 import { storage } from "./storage";
 import type { MetaSignal, RadarSnapshot, TokenSignal } from "@shared/schema";
+import {
+  fetchSvsMetadata,
+  fetchSvsMintInfo,
+  fetchSvsPrices,
+  getSvsConfig,
+  getSvsHealthReport,
+  type SvsMetadataRecord,
+  type SvsMintInfoRecord,
+  type SvsPriceRecord,
+} from "./svs";
 
 type DexLink = { type?: string; label?: string; url?: string };
 type TokenProfile = {
@@ -182,27 +192,45 @@ function buildLinks(profile?: TokenProfile, pair?: DexPair) {
   return Array.from(links.values());
 }
 
-function scorePair(pair: DexPair, profile?: TokenProfile): TokenSignal | null {
+type SvsEnrichment = {
+  metadata?: SvsMetadataRecord;
+  price?: SvsPriceRecord;
+  mintInfo?: SvsMintInfoRecord;
+};
+
+function scorePair(pair: DexPair, profile?: TokenProfile, svs: SvsEnrichment = {}): TokenSignal | null {
   const tokenAddress = safeString(profile?.tokenAddress || pair.baseToken?.address);
   const pairAddress = safeString(pair.pairAddress);
   if (!tokenAddress || !pairAddress) return null;
 
-  const description = safeString(profile?.description);
-  const name = safeString(pair.baseToken?.name, "Unknown");
-  const symbol = safeString(pair.baseToken?.symbol, "???");
+  const svsDescription = safeString(svs.metadata?.description) || safeString(svs.mintInfo?.description);
+  const description = safeString(profile?.description) || svsDescription;
+  const name = safeString(pair.baseToken?.name, "") || safeString(svs.metadata?.name, "Unknown") || "Unknown";
+  const symbol = safeString(pair.baseToken?.symbol, "") || safeString(svs.metadata?.symbol, "???") || "???";
   const txM5 = getTxns(pair, "m5");
   const txH1 = getTxns(pair, "h1");
   const txH6 = getTxns(pair, "h6");
   const txH24 = getTxns(pair, "h24");
   const m5Tx = txM5.buys + txM5.sells;
   const h1Tx = txH1.buys + txH1.sells;
-  const m5Vol = getVolume(pair, "m5");
-  const h1Vol = getVolume(pair, "h1");
-  const h6Vol = getVolume(pair, "h6");
-  const h24Vol = getVolume(pair, "h24");
+  const dexM5Vol = getVolume(pair, "m5");
+  const dexH1Vol = getVolume(pair, "h1");
+  const dexH6Vol = getVolume(pair, "h6");
+  const dexH24Vol = getVolume(pair, "h24");
+  // SVS price/volume payload — windows mapped to existing m5/h1/h6/h24 buckets.
+  const svsVol1m = n(svs.price?.volume_1min);
+  const svsVol15m = n(svs.price?.volume_15min);
+  const svsVol1h = n(svs.price?.volume_1h);
+  const svsVol24h = n(svs.price?.volume_24h);
+  const m5Vol = svsVol15m > 0 ? svsVol15m / 3 : svsVol1m > 0 ? svsVol1m * 5 : dexM5Vol;
+  const h1Vol = svsVol1h > 0 ? svsVol1h : dexH1Vol;
+  const h6Vol = svsVol24h > 0 ? svsVol24h / 4 : dexH6Vol;
+  const h24Vol = svsVol24h > 0 ? svsVol24h : dexH24Vol;
   const liquidityUsd = n(pair.liquidity?.usd);
   const marketCap = n(pair.marketCap || pair.fdv, 0) || null;
-  const priceUsd = n(pair.priceUsd, NaN);
+  const dexPriceUsd = n(pair.priceUsd, NaN);
+  const svsPriceUsd = n(svs.price?.latest_price, NaN);
+  const priceUsd = Number.isFinite(svsPriceUsd) && svsPriceUsd > 0 ? svsPriceUsd : dexPriceUsd;
   const pairAgeMinutes = pair.pairCreatedAt ? Math.max(0, (Date.now() - pair.pairCreatedAt) / 60_000) : null;
   const volumeAcceleration = h1Vol > 0 ? (m5Vol * 12) / h1Vol : m5Vol > 0 ? 4 : 0;
   const txnAcceleration = h1Tx > 0 ? (m5Tx * 12) / h1Tx : m5Tx > 0 ? 4 : 0;
@@ -321,6 +349,9 @@ function scorePair(pair: DexPair, profile?: TokenProfile): TokenSignal | null {
       profile?.amount ? "boosts/latest" : "profiles/latest",
       pair.dexId ? `${pair.dexId}` : "dex",
       profile?.cto ? "cto" : "",
+      svs.metadata ? "svs-metadata" : "",
+      svs.price ? "svs-price" : "",
+      svs.mintInfo ? "svs-mint-info" : "",
     ].filter(Boolean),
     links,
     riskFlags,
@@ -408,17 +439,83 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
     return { address, pairs: result.data };
   });
 
+  // SVS enrichment for candidate mints. Falls back gracefully if API key is
+  // missing or upstream fails — radar still works on DexScreener data alone.
+  const svsConfig = getSvsConfig();
+  let svsMetadataMap = new Map<string, SvsMetadataRecord>();
+  let svsPriceMap = new Map<string, SvsPriceRecord>();
+  if (svsConfig.hasApiKey && candidates.length) {
+    const [metaResult, priceResult] = await Promise.all([
+      fetchSvsMetadata(candidates),
+      fetchSvsPrices(candidates),
+    ]);
+    if (metaResult.ok) {
+      svsMetadataMap = metaResult.map;
+      sourceHealth.push({
+        name: "svs-metadata",
+        status: metaResult.map.size ? "ok" : "degraded",
+        detail: metaResult.map.size ? `${metaResult.map.size}/${candidates.length} mints` : "no metadata returned",
+      });
+    } else {
+      sourceHealth.push({ name: "svs-metadata", status: "degraded", detail: metaResult.error });
+    }
+    if (priceResult.ok) {
+      svsPriceMap = priceResult.map;
+      sourceHealth.push({
+        name: "svs-price",
+        status: priceResult.map.size ? "ok" : "degraded",
+        detail: priceResult.map.size ? `${priceResult.map.size}/${candidates.length} mints` : "no price returned",
+      });
+    } else {
+      sourceHealth.push({ name: "svs-price", status: "degraded", detail: priceResult.error });
+    }
+  } else if (svsConfig.hasApiKey) {
+    // configured but no candidates this round
+    sourceHealth.push({ name: "svs-api", status: "ok", detail: "configured (no candidates this cycle)" });
+  } else {
+    sourceHealth.push({ name: "svs-api", status: "missing", detail: "SVS_API_KEY not set" });
+  }
+
   const tokens = pairResults
     .flatMap(({ address, pairs }) => {
       const profile = profileByAddress.get(address);
+      const svs: SvsEnrichment = {
+        metadata: svsMetadataMap.get(address),
+        price: svsPriceMap.get(address),
+      };
       const bestPairs = pairs
         .filter((pair) => pair.chainId === "solana" && pair.baseToken?.address === address)
         .sort((a, b) => n(b.liquidity?.usd) + n(b.volume?.h1) * 0.2 - (n(a.liquidity?.usd) + n(a.volume?.h1) * 0.2))
         .slice(0, 1);
-      return bestPairs.map((pair) => scorePair(pair, profile)).filter((token): token is TokenSignal => Boolean(token));
+      return bestPairs.map((pair) => scorePair(pair, profile, svs)).filter((token): token is TokenSignal => Boolean(token));
     })
     .sort((a, b) => b.scores.final - a.scores.final)
     .slice(0, 24);
+
+  // Optional mint_info enrichment for the top short-list. Concurrency-limited
+  // and tolerant: if it fails, we keep the snapshot we already have.
+  if (svsConfig.hasApiKey && tokens.length) {
+    const topMints = tokens.slice(0, 6).map((token) => token.tokenAddress);
+    const mintInfoResult = await fetchSvsMintInfo(topMints, 3);
+    if (mintInfoResult.ok && mintInfoResult.map.size) {
+      mintInfoResult.map.forEach((info, mint) => {
+        const target = tokens.find((token) => token.tokenAddress === mint);
+        if (!target) return;
+        const extra = safeString(info.description);
+        if (extra && !target.description.includes(extra)) {
+          target.description = target.description ? `${target.description} ${extra}` : extra;
+        }
+        if (!target.sourceTags.includes("svs-mint-info")) target.sourceTags.push("svs-mint-info");
+      });
+      sourceHealth.push({
+        name: "svs-mint-info",
+        status: "ok",
+        detail: `${mintInfoResult.map.size}/${topMints.length} top mints enriched`,
+      });
+    } else if (!mintInfoResult.ok) {
+      sourceHealth.push({ name: "svs-mint-info", status: "degraded", detail: mintInfoResult.error });
+    }
+  }
 
   const snapshot: RadarSnapshot = {
     generatedAt: new Date().toISOString(),
@@ -469,6 +566,18 @@ async function latestUsableSnapshot(): Promise<RadarSnapshot | null> {
 }
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
+  app.get("/api/svs/health", async (_req, res) => {
+    try {
+      const report = await getSvsHealthReport();
+      // Only booleans/status/details are returned — never echo secret values.
+      res.json(report);
+    } catch (error) {
+      res.status(500).json({
+        message: error instanceof Error ? error.message : "svs health failed",
+      });
+    }
+  });
+
   app.get("/api/radar", async (req, res) => {
     const force = req.query.force === "1";
     try {

@@ -94,7 +94,7 @@ export const radarSnapshotSchema = z.object({
   sourceHealth: z.array(
     z.object({
       name: z.string(),
-      status: z.enum(["ok", "degraded", "error"]),
+      status: z.enum(["ok", "degraded", "error", "missing"]),
       detail: z.string(),
     }),
   ),

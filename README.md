@@ -64,6 +64,7 @@ npm start
 ## Phase 1 SVS variables
 
 ```bash
+SVS_API_BASE_URL=https://free.api.solanavibestation.com
 SVS_API_KEY=
 SVS_RPC_HTTP_URL=
 SVS_RPC_WS_URL=
@@ -71,7 +72,15 @@ SVS_GRPC_ENDPOINT=
 SVS_GRPC_X_TOKEN=
 ```
 
-Do not prefix secrets with `VITE_`. Anything prefixed with `VITE_` can be exposed to browser JavaScript.
+`SVS_API_BASE_URL` is optional and defaults to `https://free.api.solanavibestation.com`. The other variables enable enrichment and live-stream paths:
+
+- `SVS_API_KEY` — used by the backend to call `/metadata`, `/price`, and `/mint_info` (sent as `Authorization: Bearer ...`).
+- `SVS_RPC_HTTP_URL` / `SVS_RPC_WS_URL` — Solana JSON-RPC endpoints. The backend probes `getLatestBlockhash` for health checks.
+- `SVS_GRPC_ENDPOINT` / `SVS_GRPC_X_TOKEN` — Geyser gRPC. Phase 1 only checks that the endpoint is configured.
+
+Do not prefix secrets with `VITE_`. Anything prefixed with `VITE_` can be exposed to browser JavaScript. The frontend reads only `/api/svs/health`, which returns booleans/status strings — never the secret values.
+
+The app continues to work without any SVS keys — it falls back to the public DexScreener feed for both data and signals. The header SVS badge shows `connected`, `degraded`, `error`, or `not configured` based on `/api/svs/health`.
 
 ## Notes
 

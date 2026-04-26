@@ -51,6 +51,16 @@ const EVENT_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
 type SortMode = "score" | "velocity" | "virality" | "upside" | "risk";
 type FilterMode = "all" | "turbo" | "early" | "social" | "lower-risk";
 
+type SvsHealthStatus = "ok" | "degraded" | "error" | "missing";
+type SvsHealthReport = {
+  apiBaseUrl: string;
+  api: { configured: boolean; status: SvsHealthStatus; detail: string };
+  rpc: { configured: boolean; status: SvsHealthStatus; detail: string };
+  grpc: { configured: boolean; status: SvsHealthStatus; detail: string };
+  overall: SvsHealthStatus;
+  checkedAt: string;
+};
+
 function useTheme() {
   const [theme, setTheme] = useState<"light" | "dark">(() => {
     if (typeof window === "undefined") return "dark";
@@ -126,6 +136,36 @@ function Logo() {
         <p className="text-xs text-muted-foreground">Solana fast feed</p>
       </div>
     </div>
+  );
+}
+
+function SvsBadge({ health }: { health: SvsHealthReport | undefined }) {
+  if (!health) {
+    return (
+      <Badge variant="outline" data-testid="badge-svs-status" title="Solana Vibe Station status loading">
+        SVS: …
+      </Badge>
+    );
+  }
+  const variant: "default" | "secondary" | "destructive" | "outline" =
+    health.overall === "ok" ? "default"
+    : health.overall === "degraded" ? "secondary"
+    : health.overall === "error" ? "destructive"
+    : "outline";
+  const label =
+    health.overall === "ok" ? "connected"
+    : health.overall === "degraded" ? "degraded"
+    : health.overall === "error" ? "error"
+    : "not configured";
+  const tooltip = [
+    `API: ${health.api.status}${health.api.detail ? ` (${health.api.detail})` : ""}`,
+    `RPC: ${health.rpc.status}${health.rpc.detail ? ` (${health.rpc.detail})` : ""}`,
+    `gRPC: ${health.grpc.status}${health.grpc.detail ? ` (${health.grpc.detail})` : ""}`,
+  ].join(" · ");
+  return (
+    <Badge variant={variant} data-testid="badge-svs-status" title={tooltip}>
+      SVS: {label}
+    </Badge>
   );
 }
 
@@ -553,6 +593,12 @@ function RadarHome() {
     refetchInterval: live ? false : 30_000,
   });
 
+  const { data: svsHealth } = useQuery<SvsHealthReport>({
+    queryKey: ["/api/svs/health"],
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+  });
+
   const snapshot = streamSnapshot ?? data;
 
   useEffect(() => {
@@ -662,6 +708,7 @@ function RadarHome() {
                   {live ? "live stream" : "polling"}
                 </Badge>
                 <Badge variant="outline">Not financial advice</Badge>
+                <SvsBadge health={svsHealth} />
               </div>
               <h1 className="text-xl font-semibold tracking-tight">Fast memecoin velocity radar</h1>
               <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
