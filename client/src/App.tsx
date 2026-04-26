@@ -61,6 +61,22 @@ type SvsHealthReport = {
   checkedAt: string;
 };
 
+type GrpcWorkerStatus = "disabled" | "configured" | "connecting" | "connected" | "reconnecting" | "error";
+type GrpcStatusReport = {
+  status: GrpcWorkerStatus;
+  endpointConfigured: boolean;
+  hasToken: boolean;
+  activeStreams: number;
+  filters: string[];
+  lastEventAt: string | null;
+  lastEventAgeSec: number | null;
+  lastError: string | null;
+  eventsReceived: number;
+  eventsPerMinute: number;
+  candidateCount: number;
+  watchedPrograms: { name: string; programId: string }[];
+};
+
 function useTheme() {
   const [theme, setTheme] = useState<"light" | "dark">(() => {
     if (typeof window === "undefined") return "dark";
@@ -165,6 +181,38 @@ function SvsBadge({ health }: { health: SvsHealthReport | undefined }) {
   return (
     <Badge variant={variant} data-testid="badge-svs-status" title={tooltip}>
       SVS: {label}
+    </Badge>
+  );
+}
+
+function GrpcBadge({ status }: { status: GrpcStatusReport | undefined }) {
+  if (!status) {
+    return (
+      <Badge variant="outline" data-testid="badge-grpc-status" title="Live gRPC status loading">
+        gRPC: …
+      </Badge>
+    );
+  }
+  if (!status.endpointConfigured) {
+    return (
+      <Badge variant="outline" data-testid="badge-grpc-status" title="SVS_GRPC_ENDPOINT not set">
+        gRPC: not configured
+      </Badge>
+    );
+  }
+  const variant: "default" | "secondary" | "destructive" | "outline" =
+    status.status === "connected" ? "default"
+    : status.status === "reconnecting" || status.status === "connecting" || status.status === "configured" ? "secondary"
+    : status.status === "error" ? "destructive"
+    : "outline";
+  const label = status.status === "connected" ? "live" : status.status;
+  const ageBit = status.lastEventAgeSec != null
+    ? `, ${status.lastEventAgeSec < 90 ? `${status.lastEventAgeSec}s` : `${Math.floor(status.lastEventAgeSec / 60)}m`} since last event`
+    : "";
+  const tooltip = `Status: ${status.status}${ageBit} · ${status.candidateCount} live mints · ${status.eventsPerMinute}/min · filters: ${status.filters.join(", ") || "—"}${status.lastError ? ` · last error: ${status.lastError}` : ""}`;
+  return (
+    <Badge variant={variant} data-testid="badge-grpc-status" title={tooltip}>
+      gRPC: {label} · {status.candidateCount} mints
     </Badge>
   );
 }
@@ -599,6 +647,12 @@ function RadarHome() {
     staleTime: 30_000,
   });
 
+  const { data: grpcStatus } = useQuery<GrpcStatusReport>({
+    queryKey: ["/api/grpc/status"],
+    refetchInterval: 15_000,
+    staleTime: 5_000,
+  });
+
   const snapshot = streamSnapshot ?? data;
 
   useEffect(() => {
@@ -709,6 +763,7 @@ function RadarHome() {
                 </Badge>
                 <Badge variant="outline">Not financial advice</Badge>
                 <SvsBadge health={svsHealth} />
+                <GrpcBadge status={grpcStatus} />
               </div>
               <h1 className="text-xl font-semibold tracking-tight">Fast memecoin velocity radar</h1>
               <p className="mt-1 max-w-3xl text-sm text-muted-foreground">

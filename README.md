@@ -76,9 +76,37 @@ SVS_GRPC_X_TOKEN=
 
 - `SVS_API_KEY` — used by the backend to call `/metadata`, `/price`, and `/mint_info` (sent as `Authorization: Bearer ...`).
 - `SVS_RPC_HTTP_URL` / `SVS_RPC_WS_URL` — Solana JSON-RPC endpoints. The backend probes `getLatestBlockhash` for health checks.
-- `SVS_GRPC_ENDPOINT` / `SVS_GRPC_X_TOKEN` — Geyser gRPC. Phase 1 only checks that the endpoint is configured.
+- `SVS_GRPC_ENDPOINT` / `SVS_GRPC_X_TOKEN` — Geyser gRPC. When set, the backend starts a Yellowstone-based worker that subscribes to live transactions on the watched program IDs (see below) and feeds candidates into the radar.
 
-Do not prefix secrets with `VITE_`. Anything prefixed with `VITE_` can be exposed to browser JavaScript. The frontend reads only `/api/svs/health`, which returns booleans/status strings — never the secret values.
+### gRPC live worker
+
+The backend boots a Yellowstone gRPC worker only when `SVS_GRPC_ENDPOINT` is set. The worker:
+
+- Connects to SVS Geyser using `SVS_GRPC_X_TOKEN` (optional for IP-whitelist plans).
+- Subscribes to **transaction** updates with `vote: false`, `failed: false`.
+- Groups filters as `launchpads` (PumpSwap, Raydium LaunchLab, Pump.fun) and `dexPools` (Raydium CPMM, AMM v4, CLMM) using `accountInclude` against the watched program IDs.
+- Auto-reconnects with exponential backoff (1s → 30s).
+- Sends a keepalive ping every ~30s.
+- Maintains an in-memory candidate cache of recent mints (45-minute TTL, 1k cap), filtered to drop SOL/wSOL, USDC/USDT, BONK, WIF, etc.
+
+The worker never crashes the web server: if the connection fails, the radar keeps working on its DexScreener fallback.
+
+Sanitized status is exposed at `GET /api/grpc/status` and a summary is also embedded in `GET /api/svs/health` and `GET /api/radar`. Status fields cover `status` (`disabled` / `configured` / `connecting` / `connected` / `reconnecting` / `error`), `activeStreams`, `filters`, `lastEventAt`, `lastEventAgeSec`, `lastError`, `eventsReceived`, `eventsPerMinute`, `candidateCount`, and the configured `watchedPrograms`. The header shows a `gRPC` badge with the same info.
+
+Watched-program env vars (defaults baked in; set blank to disable):
+
+```bash
+WATCH_PUMPSWAP_PROGRAM=pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
+WATCH_RAYDIUM_LAUNCHLAB_PROGRAM=LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj
+WATCH_RAYDIUM_CPMM_PROGRAM=CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C
+WATCH_RAYDIUM_AMM_V4_PROGRAM=675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8
+WATCH_RAYDIUM_CLMM_PROGRAM=
+WATCH_PUMPFUN_PROGRAM=
+```
+
+gRPC candidates are merged into the radar candidate list with priority above DexScreener. Mints that show on gRPC but have no DexScreener pair surface as conservative `grpc-only` `TokenSignal` entries with `riskFlags` like `pre-dex or no pair yet` and `grpc-only early signal`, and `sourceTags` including `grpc-live` and `grpc-transaction`. Liquidity and market cap are unknown for these and the conservative score never lets them dominate the ranking — they exist as a watchlist seed, not a buy signal.
+
+Do not prefix secrets with `VITE_`. Anything prefixed with `VITE_` can be exposed to browser JavaScript. The frontend reads only `/api/svs/health` and `/api/grpc/status`, both of which return booleans/status strings — never the secret values.
 
 The app continues to work without any SVS keys — it falls back to the public DexScreener feed for both data and signals. The header SVS badge shows `connected`, `degraded`, `error`, or `not configured` based on `/api/svs/health`.
 

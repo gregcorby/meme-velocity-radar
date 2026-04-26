@@ -4,6 +4,7 @@ import type { Request } from 'express';
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
+import { startGrpcWorker } from "./grpcStream";
 
 const app = express();
 const httpServer = createServer(app);
@@ -100,6 +101,21 @@ app.use((req, res, next) => {
     },
     () => {
       log(`serving on port ${port}`);
+      try {
+        const result = startGrpcWorker();
+        if (result.started) {
+          log("gRPC worker started", "grpc");
+        } else {
+          log(`gRPC worker not started: ${result.reason ?? "unknown"}`, "grpc");
+        }
+      } catch (error) {
+        log(
+          `gRPC worker failed to start: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          "grpc",
+        );
+      }
     },
   );
 })();

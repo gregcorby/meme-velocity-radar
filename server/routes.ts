@@ -12,6 +12,11 @@ import {
   type SvsMintInfoRecord,
   type SvsPriceRecord,
 } from "./svs";
+import {
+  getGrpcStatus,
+  getRecentGrpcCandidates,
+  type GrpcCandidate,
+} from "./grpcStream";
 
 type DexLink = { type?: string; label?: string; url?: string };
 type TokenProfile = {
@@ -360,6 +365,100 @@ function scorePair(pair: DexPair, profile?: TokenProfile, svs: SvsEnrichment = {
   };
 }
 
+function buildGrpcOnlyToken(
+  candidate: GrpcCandidate,
+  meta: SvsMetadataRecord | undefined,
+  price: SvsPriceRecord | undefined,
+): TokenSignal {
+  const name = safeString(meta?.name) || `grpc:${candidate.mint.slice(0, 4)}…${candidate.mint.slice(-4)}`;
+  const symbol = safeString(meta?.symbol) || "???";
+  const description = safeString(meta?.description);
+  const { type: memeType, decode } = classifyMeme(name, symbol, description);
+  const story = firstSentence(description);
+  const priceUsd = n(price?.latest_price, NaN);
+  const m5Vol = n(price?.volume_15min) > 0 ? n(price?.volume_15min) / 3 : n(price?.volume_1min) * 5;
+  const h1Vol = n(price?.volume_1h);
+  const h6Vol = n(price?.volume_24h) > 0 ? n(price?.volume_24h) / 4 : 0;
+  const h24Vol = n(price?.volume_24h);
+  const ageMinutes = Math.max(0, (Date.now() - Date.parse(candidate.firstSeenAt)) / 60_000);
+  const sourceTags = Array.from(
+    new Set([...candidate.sourceTags, meta ? "svs-metadata" : "", price ? "svs-price" : ""].filter(Boolean)),
+  );
+  const opportunityFlags = ["grpc live tx", `grpc source: ${candidate.source}`];
+  if (candidate.txCount > 1) opportunityFlags.push(`${candidate.txCount} grpc txs`);
+  const riskFlags = ["pre-dex or no pair yet", "grpc-only early signal"];
+  if (!meta) riskFlags.push("no svs metadata");
+  if (!price) riskFlags.push("no svs price");
+
+  // Conservative scoring: gRPC-only signals can never dominate the ranking.
+  const velocity = clamp(20 + Math.min(candidate.txCount, 8) * 4);
+  const virality = clamp(description ? 25 : 12);
+  const upside = clamp(20 + (price ? 8 : 0) + (meta ? 6 : 0));
+  const risk = clamp(45 + (meta ? 0 : 6) + (price ? 0 : 6));
+  const final = clamp(upside * 0.4 + velocity * 0.3 + virality * 0.2 - risk * 0.2);
+
+  const links: TokenSignal["links"] = [];
+  if (meta?.uri && /^https?:\/\//.test(meta.uri)) {
+    links.push({ type: "metadata", label: "metadata uri", url: meta.uri });
+  }
+  if (typeof meta?.image === "string" && /^https?:\/\//.test(meta.image)) {
+    links.push({ type: "image", label: "image", url: meta.image });
+  }
+
+  return {
+    id: `grpc-${candidate.mint}`,
+    chainId: "solana",
+    tokenAddress: candidate.mint,
+    pairAddress: "",
+    dexId: candidate.source,
+    url: "",
+    name,
+    symbol,
+    imageUrl: typeof meta?.image === "string" ? meta.image : null,
+    headerUrl: null,
+    description,
+    memeType,
+    memeDecode: story
+      ? `${decode} Metadata lead: “${story}”`
+      : `${decode} (Surfaced from live gRPC tx on ${candidate.source} before a DEX pair appeared.)`,
+    viralityThesis: description
+      ? `Has metadata; ${candidate.txCount} live gRPC tx${candidate.txCount > 1 ? "s" : ""} on ${candidate.source}.`
+      : `No metadata yet; only ${candidate.txCount} live gRPC tx${candidate.txCount > 1 ? "s" : ""} on ${candidate.source}.`,
+    upsideThesis: `Pre-DEX surface: liquidity/marketCap unknown. Treat as a watchlist seed, not a buy signal.`,
+    dangerNote: "gRPC-only early signal. No DexScreener pair, no liquidity verified, narrative may not exist yet.",
+    priceUsd: Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : null,
+    marketCap: null,
+    fdv: null,
+    liquidityUsd: 0,
+    pairAgeMinutes: Math.round(ageMinutes),
+    volume: { m5: m5Vol, h1: h1Vol, h6: h6Vol, h24: h24Vol },
+    priceChange: { m5: 0, h1: 0, h6: 0, h24: 0 },
+    txns: {
+      m5: { buys: 0, sells: 0 },
+      h1: { buys: 0, sells: 0 },
+      h6: { buys: 0, sells: 0 },
+      h24: { buys: 0, sells: 0 },
+    },
+    boostAmount: 0,
+    boostTotalAmount: 0,
+    buyPressureM5: 0.5,
+    buyPressureH1: 0.5,
+    volumeAcceleration: 0,
+    txnAcceleration: 0,
+    sourceTags,
+    links,
+    riskFlags,
+    opportunityFlags,
+    scores: {
+      velocity: Math.round(velocity),
+      virality: Math.round(virality),
+      upside: Math.round(upside),
+      risk: Math.round(risk),
+      final: Math.round(final),
+    },
+  };
+}
+
 function normalizeMeta(meta: DexMeta): MetaSignal {
   return {
     name: safeString(meta.name, "Unknown meta"),
@@ -424,11 +523,20 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
     }
   });
 
+  const grpcCandidatesRaw = getRecentGrpcCandidates(40);
+  const grpcCandidateByMint = new Map<string, GrpcCandidate>();
+  for (const candidate of grpcCandidatesRaw) {
+    grpcCandidateByMint.set(candidate.mint, candidate);
+  }
+  const grpcMints = grpcCandidatesRaw.map((entry) => entry.mint);
+
   const prioritizedCandidates = [
+    ...grpcMints,
     ...boosts.filter((profile) => profile.chainId === "solana").map((profile) => profile.tokenAddress).filter(Boolean),
     ...updates.filter((profile) => profile.chainId === "solana").map((profile) => profile.tokenAddress).filter(Boolean),
     ...profiles.filter((profile) => profile.chainId === "solana").map((profile) => profile.tokenAddress).filter(Boolean),
   ] as string[];
+  // gRPC candidates get priority but we still cap total candidates to keep DexScreener calls bounded.
   const candidates = Array.from(new Set(prioritizedCandidates)).slice(0, MAX_CANDIDATES);
   const pairResults = await mapPool(candidates, 7, async (address) => {
     const result = await fetchJson<DexPair[]>(`/token-pairs/v1/solana/${address}`, `pairs:${address}`, 6_000);
@@ -476,6 +584,7 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
     sourceHealth.push({ name: "svs-api", status: "missing", detail: "SVS_API_KEY not set" });
   }
 
+  const matchedAddresses = new Set<string>();
   const tokens = pairResults
     .flatMap(({ address, pairs }) => {
       const profile = profileByAddress.get(address);
@@ -487,10 +596,38 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
         .filter((pair) => pair.chainId === "solana" && pair.baseToken?.address === address)
         .sort((a, b) => n(b.liquidity?.usd) + n(b.volume?.h1) * 0.2 - (n(a.liquidity?.usd) + n(a.volume?.h1) * 0.2))
         .slice(0, 1);
-      return bestPairs.map((pair) => scorePair(pair, profile, svs)).filter((token): token is TokenSignal => Boolean(token));
-    })
-    .sort((a, b) => b.scores.final - a.scores.final)
-    .slice(0, 24);
+      const built = bestPairs
+        .map((pair) => scorePair(pair, profile, svs))
+        .filter((token): token is TokenSignal => Boolean(token));
+      if (built.length) {
+        matchedAddresses.add(address);
+        const grpcCandidate = grpcCandidateByMint.get(address);
+        if (grpcCandidate) {
+          for (const token of built) {
+            for (const tag of grpcCandidate.sourceTags) {
+              if (!token.sourceTags.includes(tag)) token.sourceTags.push(tag);
+            }
+            if (!token.opportunityFlags.includes("grpc live tx")) {
+              token.opportunityFlags.push("grpc live tx");
+            }
+          }
+        }
+      }
+      return built;
+    });
+
+  // gRPC-only candidates: surface conservative TokenSignal entries when no
+  // DexScreener pair exists yet but we have at least gRPC tx evidence and
+  // ideally SVS metadata/price.
+  for (const candidate of grpcCandidatesRaw) {
+    if (matchedAddresses.has(candidate.mint)) continue;
+    const meta = svsMetadataMap.get(candidate.mint);
+    const price = svsPriceMap.get(candidate.mint);
+    tokens.push(buildGrpcOnlyToken(candidate, meta, price));
+  }
+
+  tokens.sort((a, b) => b.scores.final - a.scores.final);
+  tokens.splice(24);
 
   // Optional mint_info enrichment for the top short-list. Concurrency-limited
   // and tolerant: if it fails, we keep the snapshot we already have.
@@ -517,6 +654,19 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
     }
   }
 
+  const grpcStatus = getGrpcStatus();
+  if (grpcStatus.endpointConfigured) {
+    const detail = `${grpcStatus.status} · ${grpcStatus.candidateCount} mints · ${grpcStatus.eventsPerMinute}/min`;
+    const status =
+      grpcStatus.status === "connected" ? "ok"
+      : grpcStatus.status === "error" ? "error"
+      : grpcStatus.status === "disabled" ? "missing"
+      : "degraded";
+    sourceHealth.push({ name: "svs-grpc", status, detail });
+  } else {
+    sourceHealth.push({ name: "svs-grpc", status: "missing", detail: "SVS_GRPC_ENDPOINT not set" });
+  }
+
   const snapshot: RadarSnapshot = {
     generatedAt: new Date().toISOString(),
     latencyMs: Date.now() - started,
@@ -526,6 +676,18 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
     sourceHealth,
     metas: metas.slice(0, 8).map(normalizeMeta),
     tokens,
+    grpc: {
+      status: grpcStatus.status,
+      endpointConfigured: grpcStatus.endpointConfigured,
+      hasToken: grpcStatus.hasToken,
+      activeStreams: grpcStatus.activeStreams,
+      filters: grpcStatus.filters,
+      lastEventAt: grpcStatus.lastEventAt,
+      lastEventAgeSec: grpcStatus.lastEventAgeSec,
+      eventsReceived: grpcStatus.eventsReceived,
+      eventsPerMinute: grpcStatus.eventsPerMinute,
+      candidateCount: grpcStatus.candidateCount,
+    },
   };
 
   if (!snapshot.tokens.length && (candidates.length === 0 || sourceHealth.some((source) => source.status === "error"))) {
@@ -569,11 +731,31 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/svs/health", async (_req, res) => {
     try {
       const report = await getSvsHealthReport();
-      // Only booleans/status/details are returned — never echo secret values.
-      res.json(report);
+      const grpcStatus = getGrpcStatus();
+      // Augment health with sanitized gRPC worker summary — never echo secret values.
+      const grpcSummary = {
+        worker: grpcStatus.status,
+        activeStreams: grpcStatus.activeStreams,
+        filters: grpcStatus.filters,
+        candidateCount: grpcStatus.candidateCount,
+        eventsPerMinute: grpcStatus.eventsPerMinute,
+        lastEventAgeSec: grpcStatus.lastEventAgeSec,
+      };
+      res.json({ ...report, grpc: { ...report.grpc, ...grpcSummary } });
     } catch (error) {
       res.status(500).json({
         message: error instanceof Error ? error.message : "svs health failed",
+      });
+    }
+  });
+
+  app.get("/api/grpc/status", (_req, res) => {
+    try {
+      // Sanitized status — never expose secret values like SVS_GRPC_X_TOKEN.
+      res.json(getGrpcStatus());
+    } catch (error) {
+      res.status(500).json({
+        message: error instanceof Error ? error.message : "grpc status failed",
       });
     }
   });

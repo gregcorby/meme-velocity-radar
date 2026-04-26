@@ -85,6 +85,19 @@ export const metaSignalSchema = z.object({
   marketCapChange: timeframeStatsSchema,
 });
 
+export const grpcSummarySchema = z.object({
+  status: z.enum(["disabled", "configured", "connecting", "connected", "reconnecting", "error"]),
+  endpointConfigured: z.boolean(),
+  hasToken: z.boolean(),
+  activeStreams: z.number(),
+  filters: z.array(z.string()),
+  lastEventAt: z.string().nullable(),
+  lastEventAgeSec: z.number().nullable(),
+  eventsReceived: z.number(),
+  eventsPerMinute: z.number(),
+  candidateCount: z.number(),
+});
+
 export const radarSnapshotSchema = z.object({
   generatedAt: z.string(),
   latencyMs: z.number(),
@@ -100,8 +113,10 @@ export const radarSnapshotSchema = z.object({
   ),
   metas: z.array(metaSignalSchema),
   tokens: z.array(tokenSignalSchema),
+  grpc: grpcSummarySchema.optional(),
 });
 
 export type TokenSignal = z.infer<typeof tokenSignalSchema>;
 export type MetaSignal = z.infer<typeof metaSignalSchema>;
 export type RadarSnapshot = z.infer<typeof radarSnapshotSchema>;
+export type GrpcSummary = z.infer<typeof grpcSummarySchema>;
