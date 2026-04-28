@@ -75,8 +75,43 @@ const DEX = "https://api.dexscreener.com";
 const CACHE_MS = 25_000;
 const REFRESH_SECONDS = 20;
 const MAX_CANDIDATES = 14;
+// Hard cap on the total time /api/radar will spend building a snapshot. If
+// fetches are slow or the event loop is starved, we return whatever we have
+// (or the last good snapshot) instead of hanging the request for minutes.
+const RADAR_BUILD_DEADLINE_MS = 12_000;
+const HEALTH_DEADLINE_MS = 6_000;
 let memoryCache: { expires: number; snapshot: RadarSnapshot } | null = null;
 let lastGoodSnapshot: RadarSnapshot | null = null;
+let inflightSnapshot: Promise<RadarSnapshot> | null = null;
+
+function withDeadline<T>(promise: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        resolve(onTimeout());
+      } catch {
+        resolve(onTimeout());
+      }
+    }, ms);
+    promise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(onTimeout());
+      },
+    );
+  });
+}
 
 function clamp(value: number, min = 0, max = 100) {
   if (!Number.isFinite(value)) return min;
@@ -101,20 +136,42 @@ function compactUrlLabel(url: string) {
   }
 }
 
-async function fetchJson<T>(path: string, label: string, timeoutMs = 8_000): Promise<{ ok: true; data: T } | { ok: false; error: string; label: string }> {
+async function fetchJson<T>(path: string, label: string, timeoutMs = 6_000): Promise<{ ok: true; data: T } | { ok: false; error: string; label: string }> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(`${DEX}${path}`, {
-      signal: controller.signal,
-      headers: { "User-Agent": "meme-velocity-radar/1.0" },
-    });
-    if (!response.ok) {
-      return { ok: false, error: `${response.status} ${response.statusText}`, label };
+  const timer = setTimeout(() => {
+    try {
+      controller.abort();
+    } catch {
+      // ignore
     }
-    return { ok: true, data: (await response.json()) as T };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : "unknown fetch error", label };
+  }, timeoutMs);
+  // Wrap the fetch in a hard deadline to defend against event-loop starvation
+  // where the AbortController's setTimeout might be delayed past the timeout.
+  const hardDeadline = new Promise<{ ok: false; error: string; label: string }>((resolve) => {
+    setTimeout(
+      () => resolve({ ok: false, error: `hard deadline ${timeoutMs + 2_000}ms`, label }),
+      timeoutMs + 2_000,
+    );
+  });
+  try {
+    const result = await Promise.race([
+      (async () => {
+        try {
+          const response = await fetch(`${DEX}${path}`, {
+            signal: controller.signal,
+            headers: { "User-Agent": "meme-velocity-radar/1.0" },
+          });
+          if (!response.ok) {
+            return { ok: false as const, error: `${response.status} ${response.statusText}`, label };
+          }
+          return { ok: true as const, data: (await response.json()) as T };
+        } catch (error) {
+          return { ok: false as const, error: error instanceof Error ? error.message : "unknown fetch error", label };
+        }
+      })(),
+      hardDeadline,
+    ]);
+    return result;
   } finally {
     clearTimeout(timer);
   }
@@ -727,31 +784,104 @@ async function latestUsableSnapshot(): Promise<RadarSnapshot | null> {
   }
 }
 
-export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
-  app.get("/api/svs/health", async (_req, res) => {
-    try {
-      const report = await getSvsHealthReport();
-      const grpcStatus = getGrpcStatus();
-      // Augment health with sanitized gRPC worker summary — never echo secret values.
-      const grpcSummary = {
-        worker: grpcStatus.status,
+async function buildSnapshotWithDeadline(force: boolean): Promise<RadarSnapshot> {
+  // Coalesce concurrent /api/radar calls onto a single in-flight build to
+  // protect a small Railway container from running multiple builds in
+  // parallel under load.
+  if (!inflightSnapshot) {
+    const work = (async () => {
+      try {
+        return await buildSnapshot(force);
+      } finally {
+        // Defer the clear so additional callers in the same tick still
+        // receive the in-flight promise.
+        setImmediate(() => {
+          inflightSnapshot = null;
+        });
+      }
+    })();
+    inflightSnapshot = work;
+  }
+
+  return withDeadline(inflightSnapshot, RADAR_BUILD_DEADLINE_MS, () => {
+    const fallback =
+      (memoryCache?.snapshot && structuredClone(memoryCache.snapshot)) ||
+      (lastGoodSnapshot && structuredClone(lastGoodSnapshot)) ||
+      null;
+    if (fallback) {
+      fallback.sourceHealth = [
+        {
+          name: "deadline",
+          status: "degraded",
+          detail: `radar build exceeded ${RADAR_BUILD_DEADLINE_MS}ms — serving last cached snapshot`,
+        },
+        ...(fallback.sourceHealth ?? []),
+      ];
+      return fallback;
+    }
+    // No cache yet — return an empty but well-formed snapshot rather than hanging.
+    const grpcStatus = getGrpcStatus();
+    return {
+      generatedAt: new Date().toISOString(),
+      latencyMs: RADAR_BUILD_DEADLINE_MS,
+      scannedTokens: 0,
+      dataMode: "deadline-fallback",
+      refreshSeconds: REFRESH_SECONDS,
+      sourceHealth: [
+        {
+          name: "deadline",
+          status: "degraded",
+          detail: `radar build exceeded ${RADAR_BUILD_DEADLINE_MS}ms — no cached snapshot available yet`,
+        },
+      ],
+      metas: [],
+      tokens: [],
+      grpc: {
+        status: grpcStatus.status,
+        endpointConfigured: grpcStatus.endpointConfigured,
+        hasToken: grpcStatus.hasToken,
         activeStreams: grpcStatus.activeStreams,
         filters: grpcStatus.filters,
-        candidateCount: grpcStatus.candidateCount,
-        eventsPerMinute: grpcStatus.eventsPerMinute,
+        lastEventAt: grpcStatus.lastEventAt,
         lastEventAgeSec: grpcStatus.lastEventAgeSec,
-      };
-      res.json({ ...report, grpc: { ...report.grpc, ...grpcSummary } });
-    } catch (error) {
-      res.status(500).json({
-        message: error instanceof Error ? error.message : "svs health failed",
-      });
-    }
+        eventsReceived: grpcStatus.eventsReceived,
+        eventsPerMinute: grpcStatus.eventsPerMinute,
+        candidateCount: grpcStatus.candidateCount,
+      },
+    } as RadarSnapshot;
+  });
+}
+
+export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
+  app.get("/api/svs/health", async (_req, res) => {
+    // Deadline-bound: never wait on radar fetches or external APIs longer than HEALTH_DEADLINE_MS.
+    const grpcStatus = getGrpcStatus();
+    const grpcSummary = {
+      worker: grpcStatus.status,
+      activeStreams: grpcStatus.activeStreams,
+      filters: grpcStatus.filters,
+      candidateCount: grpcStatus.candidateCount,
+      eventsPerMinute: grpcStatus.eventsPerMinute,
+      lastEventAgeSec: grpcStatus.lastEventAgeSec,
+      eventsReceived: grpcStatus.eventsReceived,
+      diagnostics: grpcStatus.diagnostics,
+    };
+    const fallbackReport = {
+      apiBaseUrl: "",
+      api: { configured: false, status: "degraded" as const, detail: "health probe deadline exceeded" },
+      rpc: { configured: false, status: "degraded" as const, detail: "health probe deadline exceeded" },
+      grpc: { configured: grpcStatus.endpointConfigured, status: "degraded" as const, detail: "health probe deadline exceeded" },
+      authCooldown: { cooling: false, remainingSec: 0, lastStatus: null as number | null },
+      overall: "degraded" as const,
+      checkedAt: new Date().toISOString(),
+    };
+    const report = await withDeadline(getSvsHealthReport(), HEALTH_DEADLINE_MS, () => fallbackReport);
+    res.json({ ...report, grpc: { ...report.grpc, ...grpcSummary } });
   });
 
   app.get("/api/grpc/status", (_req, res) => {
+    // Synchronous and instant — never waits on gRPC stream or external APIs.
     try {
-      // Sanitized status — never expose secret values like SVS_GRPC_X_TOKEN.
       res.json(getGrpcStatus());
     } catch (error) {
       res.status(500).json({
@@ -763,13 +893,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/radar", async (req, res) => {
     const force = req.query.force === "1";
     try {
-      res.json(await buildSnapshot(force));
+      const snapshot = await buildSnapshotWithDeadline(force);
+      res.json(snapshot);
     } catch (error) {
       const latest = await storage.getLatestRadarSnapshot().catch(() => undefined);
       if (latest) {
-        const snapshot = JSON.parse(latest.payload) as RadarSnapshot;
-        snapshot.sourceHealth.unshift({ name: "cache", status: "degraded", detail: "serving last saved snapshot" });
-        return res.json(snapshot);
+        try {
+          const snapshot = JSON.parse(latest.payload) as RadarSnapshot;
+          snapshot.sourceHealth.unshift({ name: "cache", status: "degraded", detail: "serving last saved snapshot" });
+          return res.json(snapshot);
+        } catch {
+          // fall through
+        }
       }
       res.status(502).json({ message: error instanceof Error ? error.message : "scanner failed" });
     }

@@ -93,16 +93,41 @@ The worker never crashes the web server: if the connection fails, the radar keep
 
 Sanitized status is exposed at `GET /api/grpc/status` and a summary is also embedded in `GET /api/svs/health` and `GET /api/radar`. Status fields cover `status` (`disabled` / `configured` / `connecting` / `connected` / `reconnecting` / `error`), `activeStreams`, `filters`, `lastEventAt`, `lastEventAgeSec`, `lastError`, `eventsReceived`, `eventsPerMinute`, `candidateCount`, and the configured `watchedPrograms`. The header shows a `gRPC` badge with the same info.
 
-Watched-program env vars (defaults baked in; set blank to disable):
+Watched-program env vars and stream toggles. The defaults below are the
+**safe production defaults**: launchpads + Raydium CPMM are on, but Raydium
+AMM v4 (the highest-volume mature pool stream and the most likely to OOM a
+small Railway container) is off until you opt in.
 
 ```bash
+# Stream-group toggles
+ENABLE_GRPC_DEX_POOLS=true     # Raydium CPMM / CLMM. Set false to launchpad-only.
+ENABLE_RAYDIUM_AMM_V4=false    # Raydium AMM v4 firehose. Only enable on a sized host.
+
+# Watched programs (set blank to disable)
 WATCH_PUMPSWAP_PROGRAM=pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
 WATCH_RAYDIUM_LAUNCHLAB_PROGRAM=LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj
 WATCH_RAYDIUM_CPMM_PROGRAM=CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C
-WATCH_RAYDIUM_AMM_V4_PROGRAM=675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8
+WATCH_RAYDIUM_AMM_V4_PROGRAM=   # blank = off; set explicitly to override AMM v4 toggle
 WATCH_RAYDIUM_CLMM_PROGRAM=
 WATCH_PUMPFUN_PROGRAM=
 ```
+
+Either `ENABLE_RAYDIUM_AMM_V4=true` OR an explicit `WATCH_RAYDIUM_AMM_V4_PROGRAM`
+value is enough to enable the AMM v4 stream — the explicit program ID is
+treated as opt-in. With both blank/false the worker subscribes only to
+launch-focused programs (PumpSwap, Raydium LaunchLab) and Raydium CPMM,
+which is well within the budget of a small Railway container.
+
+`/api/grpc/status` is synchronous and always returns instantly — it never
+waits on the gRPC stream or external APIs. `/api/svs/health` and
+`/api/radar` both run under hard deadlines and fall back to the last
+cached snapshot rather than hanging behind slow upstream fetches.
+
+`/api/grpc/status.diagnostics` exposes parse counters
+(`eventsWithTokenBalances`, `eventsWithCandidateMints`, `eventsByProgram`,
+`eventsByFilter`, `ignoredBaseMintCount`, `parseErrorCount`,
+`lastCandidateAt`, `lastCandidateAgeSec`, `ignoredReasonCounts`) so a
+`candidateCount: 0` despite high `eventsReceived` is explainable.
 
 gRPC candidates are merged into the radar candidate list with priority above DexScreener. Mints that show on gRPC but have no DexScreener pair surface as conservative `grpc-only` `TokenSignal` entries with `riskFlags` like `pre-dex or no pair yet` and `grpc-only early signal`, and `sourceTags` including `grpc-live` and `grpc-transaction`. Liquidity and market cap are unknown for these and the conservative score never lets them dominate the ranking — they exist as a watchlist seed, not a buy signal.
 

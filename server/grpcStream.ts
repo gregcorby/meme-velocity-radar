@@ -16,6 +16,18 @@ type GrpcStatusKind =
   | "reconnecting"
   | "error";
 
+export type GrpcDiagnostics = {
+  eventsWithTokenBalances: number;
+  eventsWithCandidateMints: number;
+  eventsByProgram: Record<string, number>;
+  eventsByFilter: Record<string, number>;
+  ignoredBaseMintCount: number;
+  parseErrorCount: number;
+  lastCandidateAt: string | null;
+  lastCandidateAgeSec: number | null;
+  ignoredReasonCounts: Record<string, number>;
+};
+
 export type GrpcStatus = {
   status: GrpcStatusKind;
   endpointConfigured: boolean;
@@ -29,6 +41,7 @@ export type GrpcStatus = {
   eventsPerMinute: number;
   candidateCount: number;
   watchedPrograms: { name: string; programId: string }[];
+  diagnostics: GrpcDiagnostics;
 };
 
 export type GrpcCandidate = {
@@ -64,30 +77,59 @@ const CANDIDATE_MAX = 1_000;
 
 type WatchProgram = { name: string; programId: string };
 
+function parseBoolEnv(value: string | undefined, fallback: boolean): boolean {
+  if (value == null) return fallback;
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed) return fallback;
+  if (["1", "true", "yes", "on"].includes(trimmed)) return true;
+  if (["0", "false", "no", "off"].includes(trimmed)) return false;
+  return fallback;
+}
+
+// Default DEX-pool toggle: ON for CPMM/CLMM, but AMM v4 is gated behind its
+// own toggle since it is a firehose that can OOM small Railway containers.
+const ENABLE_GRPC_DEX_POOLS = parseBoolEnv(process.env.ENABLE_GRPC_DEX_POOLS, true);
+const ENABLE_RAYDIUM_AMM_V4 = parseBoolEnv(process.env.ENABLE_RAYDIUM_AMM_V4, false);
+
 function loadWatchPrograms(): WatchProgram[] {
   const list: WatchProgram[] = [];
-  const push = (name: string, envName: string, fallback?: string) => {
+  // Launchpads — always considered when configured. These are launch-focused
+  // and lower-volume than mature DEX pools.
+  const pushIf = (name: string, envName: string, fallback: string | undefined, enabled: boolean) => {
+    if (!enabled) return;
     const id = (process.env[envName] ?? fallback ?? "").trim();
     if (id) list.push({ name, programId: id });
   };
-  push("pumpswap", "WATCH_PUMPSWAP_PROGRAM", "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
-  push(
+
+  pushIf("pumpswap", "WATCH_PUMPSWAP_PROGRAM", "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", true);
+  pushIf(
     "raydium-launchlab",
     "WATCH_RAYDIUM_LAUNCHLAB_PROGRAM",
     "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",
+    true,
   );
-  push(
-    "raydium-cpmm",
-    "WATCH_RAYDIUM_CPMM_PROGRAM",
-    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
-  );
-  push(
-    "raydium-amm-v4",
-    "WATCH_RAYDIUM_AMM_V4_PROGRAM",
-    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
-  );
-  push("raydium-clmm", "WATCH_RAYDIUM_CLMM_PROGRAM");
-  push("pumpfun", "WATCH_PUMPFUN_PROGRAM");
+  pushIf("pumpfun", "WATCH_PUMPFUN_PROGRAM", undefined, true);
+
+  // DEX pools — gated by ENABLE_GRPC_DEX_POOLS. CPMM/CLMM default to enabled
+  // when the umbrella toggle is on, AMM v4 stays opt-in even within that.
+  if (ENABLE_GRPC_DEX_POOLS) {
+    pushIf(
+      "raydium-cpmm",
+      "WATCH_RAYDIUM_CPMM_PROGRAM",
+      "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
+      true,
+    );
+    pushIf("raydium-clmm", "WATCH_RAYDIUM_CLMM_PROGRAM", undefined, true);
+  }
+  // Raydium AMM v4 is high-volume; only include if the user explicitly
+  // opts in via ENABLE_RAYDIUM_AMM_V4=true OR provides an explicit
+  // WATCH_RAYDIUM_AMM_V4_PROGRAM (treated as explicit consent to track it).
+  const ammV4Explicit = (process.env.WATCH_RAYDIUM_AMM_V4_PROGRAM ?? "").trim();
+  if (ENABLE_RAYDIUM_AMM_V4 || ammV4Explicit) {
+    const id = ammV4Explicit || "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+    list.push({ name: "raydium-amm-v4", programId: id });
+  }
+
   return list;
 }
 
@@ -207,6 +249,21 @@ let activeStreams = 0;
 let activeFilterNames: string[] = [];
 let started = false;
 
+// Diagnostics — sanitized, sampled where needed. Used to explain why
+// candidateCount may be 0 even with high event volume.
+let eventsWithTokenBalances = 0;
+let eventsWithCandidateMints = 0;
+const eventsByProgram: Record<string, number> = {};
+const eventsByFilter: Record<string, number> = {};
+let ignoredBaseMintCount = 0;
+let parseErrorCount = 0;
+let lastCandidateAt: number | null = null;
+const ignoredReasonCounts: Record<string, number> = {};
+
+function bumpReason(reason: string) {
+  ignoredReasonCounts[reason] = (ignoredReasonCounts[reason] ?? 0) + 1;
+}
+
 function eventsPerMinute(): number {
   const now = Date.now();
   while (eventTimestamps.length && eventTimestamps[0] < now - EVENTS_WINDOW_MS) {
@@ -272,18 +329,26 @@ function extractAccountKeys(info: any): string[] {
   return keys;
 }
 
-function extractMints(info: any): string[] {
+function extractMints(info: any): { mints: string[]; hadAnyTokenBalances: boolean; ignoredStable: number } {
   const mints = new Set<string>();
+  let hadAnyTokenBalances = false;
+  let ignoredStable = 0;
   const meta = info?.meta;
   const balances = [
     ...(Array.isArray(meta?.preTokenBalances) ? meta.preTokenBalances : []),
     ...(Array.isArray(meta?.postTokenBalances) ? meta.postTokenBalances : []),
   ];
+  if (balances.length) hadAnyTokenBalances = true;
   for (const balance of balances) {
     const mint = typeof balance?.mint === "string" ? balance.mint : null;
-    if (mint && !STABLE_BLOCKLIST.has(mint)) mints.add(mint);
+    if (!mint) continue;
+    if (STABLE_BLOCKLIST.has(mint)) {
+      ignoredStable++;
+      continue;
+    }
+    mints.add(mint);
   }
-  return Array.from(mints);
+  return { mints: Array.from(mints), hadAnyTokenBalances, ignoredStable };
 }
 
 function findWatchedProgram(accountKeys: string[]): { sourceProgramId: string; observedPrograms: string[] } | null {
@@ -305,20 +370,51 @@ function processTransactionUpdate(update: any) {
   if (!txWrapper) return;
   const info = txWrapper.transaction;
   if (!info) return;
-  if (info.isVote) return;
-  if (info.meta?.err) return;
+  if (info.isVote) {
+    bumpReason("vote-tx");
+    return;
+  }
+  if (info.meta?.err) {
+    bumpReason("failed-tx");
+    return;
+  }
 
   recordEvent();
 
+  const filterNames: string[] = Array.isArray(update?.filters) ? update.filters.filter((s: unknown) => typeof s === "string") : [];
+  for (const f of filterNames) {
+    eventsByFilter[f] = (eventsByFilter[f] ?? 0) + 1;
+  }
+
   const accountKeys = extractAccountKeys(info);
-  if (!accountKeys.length) return;
+  if (!accountKeys.length) {
+    bumpReason("no-account-keys");
+    return;
+  }
   const watched = findWatchedProgram(accountKeys);
-  if (!watched) return;
+  if (!watched) {
+    bumpReason("no-watched-program-in-tx");
+    return;
+  }
+  for (const name of watched.observedPrograms) {
+    eventsByProgram[name] = (eventsByProgram[name] ?? 0) + 1;
+  }
   const signature = extractSignature(info);
-  if (!signature) return;
+  if (!signature) {
+    bumpReason("missing-signature");
+    return;
+  }
   const slot = Number(txWrapper.slot ?? 0);
-  const mints = extractMints(info);
-  if (!mints.length) return;
+  const { mints, hadAnyTokenBalances, ignoredStable } = extractMints(info);
+  if (hadAnyTokenBalances) eventsWithTokenBalances++;
+  if (ignoredStable) ignoredBaseMintCount += ignoredStable;
+  if (!mints.length) {
+    if (!hadAnyTokenBalances) bumpReason("no-token-balances");
+    else if (ignoredStable) bumpReason("only-stable-mints");
+    else bumpReason("no-candidate-mints");
+    return;
+  }
+  eventsWithCandidateMints++;
   for (const mint of mints) {
     candidates.upsert({
       mint,
@@ -328,6 +424,7 @@ function processTransactionUpdate(update: any) {
       observedPrograms: watched.observedPrograms,
     });
   }
+  lastCandidateAt = Date.now();
 }
 
 let stopRequested = false;
@@ -399,6 +496,7 @@ async function runStreamOnce(endpoint: string, token: string | undefined) {
           if (lastEventAt == null) lastEventAt = Date.now();
         }
       } catch (error) {
+        parseErrorCount++;
         // never let parser errors kill the stream
         // eslint-disable-next-line no-console
         console.error("[grpc] update parse error:", error);
@@ -469,6 +567,8 @@ export function getGrpcStatus(): GrpcStatus {
   const epm = eventsPerMinute();
   const lastIso = lastEventAt ? new Date(lastEventAt).toISOString() : null;
   const lastAgeSec = lastEventAt ? Math.round((Date.now() - lastEventAt) / 1000) : null;
+  const lastCandIso = lastCandidateAt ? new Date(lastCandidateAt).toISOString() : null;
+  const lastCandAge = lastCandidateAt ? Math.round((Date.now() - lastCandidateAt) / 1000) : null;
   return {
     status,
     endpointConfigured: Boolean(endpoint),
@@ -482,6 +582,17 @@ export function getGrpcStatus(): GrpcStatus {
     eventsPerMinute: epm,
     candidateCount: candidates.size(),
     watchedPrograms: WATCH_PROGRAMS.map((p) => ({ name: p.name, programId: p.programId })),
+    diagnostics: {
+      eventsWithTokenBalances,
+      eventsWithCandidateMints,
+      eventsByProgram: { ...eventsByProgram },
+      eventsByFilter: { ...eventsByFilter },
+      ignoredBaseMintCount,
+      parseErrorCount,
+      lastCandidateAt: lastCandIso,
+      lastCandidateAgeSec: lastCandAge,
+      ignoredReasonCounts: { ...ignoredReasonCounts },
+    },
   };
 }
 

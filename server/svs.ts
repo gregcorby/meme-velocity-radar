@@ -4,7 +4,35 @@
 
 const DEFAULT_API_BASE_URL = "https://free.api.solanavibestation.com";
 const SVS_TIMEOUT_MS = 8_000;
+const SVS_PROBE_TIMEOUT_MS = 3_000;
 const BATCH_SIZE = 36;
+// Cooldown after the SVS API returns an auth-rejected status (401/403). While
+// the cooldown is active we short-circuit /metadata, /price, and /mint_info
+// calls so the radar stops hammering the API with an invalid key. Probes
+// (used by /api/svs/health) skip the cooldown so users can see when the key
+// becomes valid again.
+const AUTH_REJECTED_COOLDOWN_MS = 5 * 60_000;
+let authRejectedUntil = 0;
+let lastAuthRejectStatus: number | null = null;
+
+function noteAuthRejected(status: number) {
+  authRejectedUntil = Date.now() + AUTH_REJECTED_COOLDOWN_MS;
+  lastAuthRejectStatus = status;
+}
+
+function inAuthCooldown(): { cooling: boolean; remainingMs: number } {
+  const remaining = authRejectedUntil - Date.now();
+  return { cooling: remaining > 0, remainingMs: Math.max(0, remaining) };
+}
+
+export function getSvsAuthCooldown() {
+  const { cooling, remainingMs } = inAuthCooldown();
+  return {
+    cooling,
+    remainingSec: Math.round(remainingMs / 1000),
+    lastStatus: lastAuthRejectStatus,
+  };
+}
 
 export type SvsHealthStatus = "ok" | "degraded" | "error" | "missing";
 
@@ -119,6 +147,13 @@ async function postBatch<T extends { mint?: string }>(
 ): Promise<{ ok: true; map: Map<string, T> } | { ok: false; error: string }> {
   const headers = authHeaders();
   if (!headers) return { ok: false, error: "SVS_API_KEY not configured" };
+  const cooldown = inAuthCooldown();
+  if (cooldown.cooling) {
+    return {
+      ok: false,
+      error: `auth rejected — skipping for ${Math.round(cooldown.remainingMs / 1000)}s (status ${lastAuthRejectStatus ?? "?"})`,
+    };
+  }
   const config = getSvsConfig();
   const merged = new Map<string, T>();
   try {
@@ -128,6 +163,13 @@ async function postBatch<T extends { mint?: string }>(
         headers,
         body: JSON.stringify({ mints: group }),
       });
+      if (response.status === 401 || response.status === 403) {
+        noteAuthRejected(response.status);
+        return {
+          ok: false,
+          error: `auth rejected (${response.status}) — check SVS_API_KEY / API entitlement`,
+        };
+      }
       if (!response.ok) {
         return { ok: false, error: `${response.status} ${response.statusText}` };
       }
@@ -158,13 +200,22 @@ export async function fetchSvsMintInfo(
   if (!mints.length) return { ok: true, map: new Map() };
   const headers = authHeaders();
   if (!headers) return { ok: false, error: "SVS_API_KEY not configured" };
+  const cooldown = inAuthCooldown();
+  if (cooldown.cooling) {
+    return {
+      ok: false,
+      error: `auth rejected — skipping for ${Math.round(cooldown.remainingMs / 1000)}s`,
+    };
+  }
   const config = getSvsConfig();
   const map = new Map<string, SvsMintInfoRecord>();
   let cursor = 0;
   let firstError: string | null = null;
+  let authRejected = false;
   const reqHeaders = headers;
   async function worker() {
     while (cursor < mints.length) {
+      if (authRejected) return;
       const idx = cursor++;
       const mint = mints[idx];
       try {
@@ -173,6 +224,12 @@ export async function fetchSvsMintInfo(
           headers: reqHeaders,
           body: JSON.stringify({ mint }),
         });
+        if (response.status === 401 || response.status === 403) {
+          noteAuthRejected(response.status);
+          authRejected = true;
+          if (!firstError) firstError = `auth rejected (${response.status})`;
+          return;
+        }
         if (!response.ok) {
           if (!firstError) firstError = `${response.status} ${response.statusText}`;
           continue;
@@ -210,7 +267,7 @@ export async function probeRpcReachability(): Promise<RpcProbeResult> {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getLatestBlockhash" }),
       },
-      4_000,
+      SVS_PROBE_TIMEOUT_MS,
     );
     if (!response.ok) {
       return { configured: true, status: "degraded", detail: `rpc ${response.status}` };
@@ -258,10 +315,15 @@ export async function probeSvsApiReachability(): Promise<SvsApiProbeResult> {
         headers,
         body: JSON.stringify({ mints: [probeMint] }),
       },
-      4_000,
+      SVS_PROBE_TIMEOUT_MS,
     );
     if (response.status === 401 || response.status === 403) {
-      return { configured: true, status: "error", detail: `auth rejected (${response.status})` };
+      noteAuthRejected(response.status);
+      return {
+        configured: true,
+        status: "error",
+        detail: `auth rejected (${response.status}) — check SVS_API_KEY / API entitlement; falling back to DexScreener`,
+      };
     }
     if (!response.ok) {
       // 404/422 is still "configured" — endpoint reachable, just not happy with probe.
@@ -282,6 +344,7 @@ export type SvsHealthReport = {
   api: { configured: boolean; status: SvsHealthStatus; detail: string };
   rpc: { configured: boolean; status: SvsHealthStatus; detail: string };
   grpc: { configured: boolean; status: SvsHealthStatus; detail: string };
+  authCooldown: { cooling: boolean; remainingSec: number; lastStatus: number | null };
   overall: SvsHealthStatus;
   checkedAt: string;
 };
@@ -308,6 +371,7 @@ export async function getSvsHealthReport(): Promise<SvsHealthReport> {
     api,
     rpc,
     grpc,
+    authCooldown: getSvsAuthCooldown(),
     overall,
     checkedAt: new Date().toISOString(),
   };
