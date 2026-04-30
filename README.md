@@ -2,7 +2,14 @@
 
 Live Solana memecoin velocity dashboard.
 
-The app currently runs as a full-stack Node/Express + React service. The backend scans live public DEX-indexed feeds, scores tokens for velocity, virality, upside, and risk, and streams updates to the frontend.
+The app runs as a single Node/Express process serving both the API and a Vite/React SPA. The backend ingests live program activity over SVS Geyser gRPC, falls back to DexScreener public feeds, enriches with the SVS API, scores tokens for velocity, virality, upside, and risk, and streams updates to the frontend.
+
+## Documentation
+
+- [docs/PRODUCT.md](docs/PRODUCT.md) — what the product is, who it's for, working features, non-goals, success metrics.
+- [docs/RUNBOOK.md](docs/RUNBOOK.md) — local + Railway deploy, env vars, safe defaults, health endpoints, troubleshooting.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — system diagram, data pipeline, components, safety/resilience, limitations.
+- [docs/ROADMAP.md](docs/ROADMAP.md) — P0 stabilise, P1 protocol decoders / risk / social, P2 later, acceptance criteria.
 
 ## What it does
 
@@ -13,7 +20,9 @@ The app currently runs as a full-stack Node/Express + React service. The backend
 - Exports visible signals as CSV.
 - Keeps all API keys on the backend.
 
-## Local setup
+## Quick Start
+
+Local:
 
 ```bash
 npm install
@@ -21,13 +30,9 @@ cp .env.example .env
 npm run dev
 ```
 
-Open:
+Open http://localhost:5000. Runs on the DexScreener fallback even with no SVS keys.
 
-```text
-http://localhost:5000
-```
-
-## Production build
+Production build:
 
 ```bash
 npm run build
@@ -35,6 +40,25 @@ npm start
 ```
 
 The server reads `PORT` from the host environment and defaults to `5000`.
+
+## Railway deploy (from phone)
+
+1. Railway → **New project** → **Deploy from GitHub repo** → pick this repo.
+2. Variables tab → paste the values you need (see `.env.example` and [docs/RUNBOOK.md](docs/RUNBOOK.md)).
+3. If asked: build = `npm install && npm run build`, start = `npm start`.
+4. **Settings → Networking → Generate Domain**.
+
+**Safe production defaults:** keep `ENABLE_RAYDIUM_AMM_V4=false` (or unset) and leave `WATCH_RAYDIUM_AMM_V4_PROGRAM` blank. AMM v4 is the highest-volume mature pool stream and will OOM a small Railway container; it stays opt-in for that reason.
+
+For launchpad-only ingestion (lowest event volume): also set `ENABLE_GRPC_DEX_POOLS=false`.
+
+If `/api/svs/health` returns a `403` from the SVS API, your `SVS_API_KEY` is wrong or your account does not have the API entitlement — check your SVS plan. Full troubleshooting matrix in [docs/RUNBOOK.md](docs/RUNBOOK.md).
+
+Health checks:
+
+- `GET /api/svs/health` — overall SVS status, gRPC summary, auth-cooldown state.
+- `GET /api/grpc/status` — instant gRPC worker state with `diagnostics` (parse counters, ignored-mint reasons, last candidate age).
+- `GET /api/radar` — current radar snapshot (deadline-bound, falls back to last cached snapshot).
 
 ## Railway setup
 
