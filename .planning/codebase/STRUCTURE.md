@@ -1,145 +1,151 @@
-# Directory Structure
+<!-- refreshed: 2026-05-04 -->
 
-**Analysis Date:** 2026-05-04
+# Structure — Meme Velocity Radar
 
 ## Layout
 
 ```
 meme-velocity-radar/
-├── README.md                    # Operator-oriented quick-start + Railway notes
-├── package.json                 # ESM, scripts: dev / build / start / check / db:push
-├── package-lock.json            # npm lockfile (~330 KB)
-├── tsconfig.json                # strict TS, paths @/* and @shared/*, includes client+server+shared
-├── vite.config.ts               # root=client, output dist/public, aliases
-├── tailwind.config.ts           # darkMode class, HSL CSS vars, status + chart palettes
-├── postcss.config.js            # tailwindcss + autoprefixer
-├── drizzle.config.ts            # sqlite dialect, schema → ./shared/schema.ts, db ./data.db
-├── components.json              # shadcn/ui config (style: new-york, baseColor: neutral)
-├── .env.example                 # All optional SVS vars + program watchers
-├── .gitignore                   # node_modules, dist, .vite, .env*, data.db*
-│
-├── client/                      # Vite SPA
-│   ├── public/                  # Static assets (currently empty/minimal)
+├── server/                  # Node/Express backend (single process)
+│   ├── index.ts             # boot: middleware, routes, vite/static, gRPC worker
+│   ├── routes.ts            # /api/* handlers + snapshot builder + scoring (942 LOC)
+│   ├── svs.ts               # SVS REST adapter (metadata/price/mint_info, probes)
+│   ├── grpcStream.ts        # Yellowstone gRPC worker + CandidateStore
+│   ├── storage.ts           # IStorage + Drizzle/SQLite (better-sqlite3)
+│   ├── static.ts            # production static SPA serving
+│   └── vite.ts              # dev-only Vite middleware + HMR
+├── shared/
+│   └── schema.ts            # Drizzle table + Zod contract shared with client
+├── client/                  # Vite/React SPA
+│   ├── index.html           # SPA entry HTML loaded by Vite
+│   ├── public/
+│   │   └── favicon.svg
 │   └── src/
-│       ├── main.tsx             # React mount + initial hash-location seed
-│       ├── App.tsx              # 924-line single-file SPA — every component + RadarHome
-│       ├── index.css            # Tailwind entrypoint + shadcn CSS variables (referenced from main.tsx)
+│       ├── main.tsx         # React mount + hash-router seed
+│       ├── App.tsx          # entire SPA (924 LOC) — see Naming Conventions
+│       ├── index.css        # tailwind base + theme tokens
 │       ├── components/
-│       │   └── ui/              # 47 shadcn/ui components (button, card, sheet, tabs, …)
+│       │   └── ui/          # 47 shadcn/Radix primitives
 │       ├── hooks/
-│       │   ├── use-mobile.tsx   # matchMedia breakpoint hook
-│       │   └── use-toast.ts     # shadcn toast store + reducer (191 lines)
+│       │   ├── use-mobile.tsx
+│       │   └── use-toast.ts
 │       ├── lib/
-│       │   ├── queryClient.ts   # TanStack Query client + apiRequest helper
-│       │   └── utils.ts         # cn() = twMerge(clsx(...))
+│       │   ├── queryClient.ts   # TanStack Query default queryFn + apiRequest
+│       │   └── utils.ts         # cn() helper (clsx + tailwind-merge)
 │       └── pages/
-│           └── not-found.tsx    # Wouter fallback route
-│
-├── server/                      # Express + gRPC backend (single process)
-│   ├── index.ts                 # Boot: dotenv, Express, body parsers, request logger,
-│   │                            #       error middleware, dev-Vite vs static, gRPC worker start
-│   ├── routes.ts                # 942-line: DexScreener fetcher, scoring, meme decode,
-│   │                            #          snapshot builder, deadline guards, SSE
-│   ├── svs.ts                   # 378-line: SVS REST/RPC client + auth-cooldown state machine
-│   ├── grpcStream.ts            # 605-line: Yellowstone gRPC worker, candidate cache, diagnostics
-│   ├── storage.ts               # Drizzle + better-sqlite3, single-table snapshot persistence
-│   ├── static.ts                # NODE_ENV=production: serve dist/public + SPA fallback
-│   └── vite.ts                  # NODE_ENV=development: Vite middleware + HTML transform
-│
-├── shared/                      # Code imported by BOTH client and server
-│   └── schema.ts                # Drizzle table + Zod schemas for RadarSnapshot/TokenSignal/MetaSignal
-│
-├── script/                      # Build / ops scripts
-│   └── build.ts                 # vite build (client) + esbuild (server → dist/index.cjs)
-│
-├── docs/                        # Operator-facing product documentation
-│   ├── PRODUCT.md               # What the product is, who it's for, working features, non-goals
-│   ├── ARCHITECTURE.md          # System diagram, data pipeline, components, safety, limitations
-│   ├── ROADMAP.md               # P0 stabilise, P1 decoders/risk/social, P2 later
-│   └── RUNBOOK.md               # Local + Railway deploy, env vars, health endpoints, troubleshooting
-│
-└── .planning/                   # GSD planning workspace (this directory)
-    └── codebase/                # Output of /gsd-map-codebase
+│           └── not-found.tsx    # wouter catch-all 404
+├── script/
+│   └── build.ts             # Vite client build + esbuild server bundle
+├── docs/                    # team-authored docs (PRODUCT, ARCHITECTURE, ROADMAP, RUNBOOK)
+├── .planning/codebase/      # this directory — generated codebase mapping
+├── package.json             # scripts: dev / build / start / check / db:push
+├── tsconfig.json            # strict, ESNext, paths: @/* @shared/*
+├── vite.config.ts           # plugin-react, aliases, root=client, outDir=dist/public
+├── tailwind.config.ts       # tailwind theme + tokens
+├── postcss.config.js
+├── drizzle.config.ts        # SQLite, schema=shared/schema.ts, out=./migrations
+├── components.json          # shadcn config (style: new-york, base: neutral)
+├── .env.example             # SVS_*, WATCH_*, ENABLE_* env documentation
+├── .gitignore
+├── README.md
+└── data.db                  # generated SQLite file (WAL mode), not committed
 ```
 
 ## Key Locations
 
 ### Where business logic lives
-- **Snapshot orchestration:** `server/routes.ts` — `buildSnapshot()`, `buildSnapshotWithDeadline()`. Owns the merge of DexScreener + gRPC + SVS into a single `RadarSnapshot`.
-- **Per-token scoring:** `server/routes.ts` (helpers like `clamp()`, txn/volume getters, plus the velocity / virality / upside / risk computation inside the snapshot builder loop).
-- **gRPC ingestion + parsing:** `server/grpcStream.ts` — `loadWatchPrograms()`, `buildFilters()`, the `startGrpcWorker()` reconnect loop, the token-balance parser, and the candidate cache.
-- **External API plumbing:** `server/svs.ts` — `fetchSvsMetadata`, `fetchSvsPrices`, `fetchSvsMintInfo`, `getSvsHealthReport`, `getSvsAuthCooldown`. Inline DexScreener fetches live in `server/routes.ts:139-178` (`fetchJson`).
+- **Snapshot building & scoring:** `server/routes.ts:263-517` (`scorePair`, `buildGrpcOnlyToken`, `normalizeMeta`) and the orchestration in `server/routes.ts:538-773` (`buildSnapshot`).
+- **Meme classification heuristics:** `server/routes.ts:217-241` (`classifyMeme`).
+- **Risk/opportunity flag rules:** `server/routes.ts:340-362`.
+- **gRPC candidate filtering & blocklist:** `server/grpcStream.ts:60-70` (stable mints), `server/grpcStream.ts:332-352` (token-balance extraction).
+- **SVS auth cooldown policy:** `server/svs.ts:14-35`.
 
 ### Where UI lives
-- **Entire SPA:** `client/src/App.tsx`. Every screen, badge, card, and helper is exported from this one file.
-- **Reusable primitives:** `client/src/components/ui/` (shadcn/ui — do not edit by hand without re-running the shadcn add command unless you intentionally diverge).
-- **Hooks:** `client/src/hooks/`.
-- **Tiny client utilities:** `client/src/lib/`.
+- **Single SPA file:** `client/src/App.tsx` — all components, all formatters, all queries, the router, and the providers.
+- **shadcn/ui primitives:** `client/src/components/ui/*.tsx` (47 files, generated by the shadcn CLI; do not hand-edit unless customizing a primitive).
+- **Hooks:** `client/src/hooks/use-mobile.tsx`, `client/src/hooks/use-toast.ts`.
+- **Static page:** `client/src/pages/not-found.tsx`.
 
 ### Where the data contract lives
-- `shared/schema.ts` — `radarSnapshotSchema`, `tokenSignalSchema`, `metaSignalSchema`, `grpcSummarySchema` (Zod) plus inferred TS types. **Both** server and client import from this file via the `@shared/*` alias. Do not duplicate these types in either tree.
+- `shared/schema.ts` — the **only** place where Zod schemas + types for `RadarSnapshot`, `TokenSignal`, `MetaSignal`, `GrpcSummary` are defined. Imported by server (`@shared/schema`) and client (`@shared/schema`).
 
 ### Where DB code lives
-- Schema: `shared/schema.ts:5-9` (Drizzle `sqliteTable` for `radar_snapshots`).
-- Connection + storage class: `server/storage.ts` (single instance: `storage` exported at the bottom).
-- Migrations: configured to land in `./migrations` (`drizzle.config.ts`); not currently checked in. `npm run db:push` writes schema directly.
+- Schema (Drizzle table): `shared/schema.ts:5-9`.
+- Connection + DDL bootstrap: `server/storage.ts:7-15` (creates `data.db`, enables WAL, runs `CREATE TABLE IF NOT EXISTS`).
+- Reads/writes: `server/storage.ts:24-32` (`DatabaseStorage` implements `IStorage`).
+- Drizzle Kit config (for `db:push`): `drizzle.config.ts` — outputs migrations to `./migrations`.
 
-### Where build / deploy config lives
-- Local dev: `npm run dev` → `tsx server/index.ts`; Vite is mounted as middleware at runtime by `server/vite.ts`.
-- Production build: `npm run build` → `script/build.ts`. Outputs `dist/public/` (SPA) and `dist/index.cjs` (server bundle). `dist/` is gitignored.
-- Production start: `npm start` → `node dist/index.cjs`.
-- Railway: see `docs/RUNBOOK.md` (build = `npm install && npm run build`, start = `npm start`).
+### Where build/deploy config lives
+- **Build script:** `script/build.ts`.
+- **Client build:** `vite.config.ts` (root `client`, outDir `dist/public`).
+- **Server build:** esbuild call inside `script/build.ts:47-59` → `dist/index.cjs` (CJS, minified).
+- **Bundled-vs-external dep allowlist:** `script/build.ts:7-31`.
+- **Runtime env contract:** `.env.example`.
+- **Process scripts:** `package.json:6-12`.
 
 ## Naming Conventions
 
-**Filenames:**
-- Server TypeScript: `camelCase.ts` (`grpcStream.ts`, `routes.ts`, `storage.ts`, `svs.ts`, `static.ts`, `vite.ts`, `index.ts`).
-- React component files: `PascalCase.tsx` for top-level pages (`App.tsx`), but shadcn/ui primitives use `kebab-case.tsx` (`alert-dialog.tsx`, `dropdown-menu.tsx`, `not-found.tsx`).
-- Hooks: `kebab-case.ts(x)` prefixed with `use-` (`use-toast.ts`, `use-mobile.tsx`).
-- Library helpers: `camelCase.ts` (`queryClient.ts`, `utils.ts`).
-- Config: `kebab.config.ts` (`vite.config.ts`, `tailwind.config.ts`, `drizzle.config.ts`).
+| Surface | Convention | Examples |
+| --- | --- | --- |
+| Server filenames | lowerCamelCase `.ts` | `server/grpcStream.ts`, `server/svs.ts`, `server/storage.ts` |
+| Shared filenames | lowerCamelCase `.ts` | `shared/schema.ts` |
+| Client component files | lowerCamelCase or PascalCase `.tsx` (App.tsx is PascalCase; primitives are kebab-case) | `client/src/App.tsx`, `client/src/main.tsx` |
+| shadcn/ui primitives | kebab-case `.tsx` | `client/src/components/ui/alert-dialog.tsx`, `client/src/components/ui/dropdown-menu.tsx` |
+| Hooks | `use-*.ts(x)`, kebab-case file, camelCase export | `use-mobile.tsx` exports `useIsMobile`; `use-toast.ts` exports `useToast` |
+| Pages | kebab-case `.tsx` under `pages/` | `client/src/pages/not-found.tsx` |
+| React component identifiers | PascalCase | `RadarHome`, `TokenCard`, `SvsBadge`, `MetaRail` |
+| Functions / variables | lowerCamelCase | `buildSnapshot`, `fetchJson`, `withDeadline`, `memoryCache` |
+| Types / interfaces | PascalCase | `TokenSignal`, `RadarSnapshot`, `IStorage`, `GrpcCandidate` |
+| Zod schemas | lowerCamelCase, `*Schema` suffix | `tokenSignalSchema`, `radarSnapshotSchema`, `grpcSummarySchema` |
+| Constants | SCREAMING_SNAKE_CASE | `RADAR_BUILD_DEADLINE_MS`, `MAX_CANDIDATES`, `BATCH_SIZE`, `KEEPALIVE_MS` |
+| Env vars | SCREAMING_SNAKE_CASE, prefixed by domain | `SVS_API_KEY`, `SVS_GRPC_ENDPOINT`, `WATCH_RAYDIUM_CPMM_PROGRAM`, `ENABLE_RAYDIUM_AMM_V4`, `PORT`, `NODE_ENV` |
+| Route paths | `/api/<domain>[/<resource>]`, kebab in segments only when needed | `/api/radar`, `/api/radar/stream`, `/api/svs/health`, `/api/grpc/status` |
+| TanStack Query keys | array of URL path segments mapped 1:1 to the fetch URL | `["/api/radar"]`, `["/api/svs/health"]`, `["/api/grpc/status"]` (`client/src/lib/queryClient.ts:33`) |
+| Test IDs (UI) | `data-testid="<role>-<name>"` kebab | `data-testid="button-toggle-theme"` (`client/src/App.tsx:721`) |
+| Source-health entries | lowercase descriptive name | `"token boosts"`, `"svs-metadata"`, `"svs-grpc"`, `"deadline"`, `"cache"` |
 
-**Identifiers:**
-- TypeScript types / interfaces / Zod schemas: `PascalCase` (`RadarSnapshot`, `TokenSignal`, `MetaSignal`, `GrpcSummary`, `IStorage`, `DatabaseStorage`).
-- Zod schema variables: `camelCase` ending in `Schema` (`tokenSignalSchema`, `radarSnapshotSchema`).
-- Functions / methods / variables: `camelCase` (`buildSnapshot`, `withDeadline`, `fetchJson`, `mapPool`, `recordsByMint`).
-- React components: `PascalCase` (`RadarHome`, `TokenCard`, `DetailPanel`, `SvsBadge`, `GrpcBadge`).
-- Constants (module-scoped): `SCREAMING_SNAKE_CASE` (`CACHE_MS`, `REFRESH_SECONDS`, `MAX_CANDIDATES`, `RADAR_BUILD_DEADLINE_MS`, `KEEPALIVE_MS`, `WATCH_PROGRAMS`).
-- Env vars: `SCREAMING_SNAKE_CASE` with `SVS_` / `WATCH_` / `ENABLE_` prefixes.
+## Path Aliases
 
-**Path aliases (use these, do NOT use deep relative paths):**
-- `@/*` → `client/src/*` (client-side imports)
-- `@shared/*` → `shared/*` (cross-cutting types/schema)
-- `@assets/*` → `attached_assets/*` (configured in `vite.config.ts`; directory does not currently exist)
+Defined in both `tsconfig.json:18-21` and `vite.config.ts:7-13`:
+
+| Alias | Resolves to | Used by |
+| --- | --- | --- |
+| `@/*` | `client/src/*` | client SPA only (e.g. `@/components/ui/button`, `@/lib/utils`, `@/pages/not-found`) |
+| `@shared/*` | `shared/*` | server **and** client (`@shared/schema`) — the cross-cutting contract |
+| `@assets/*` | `attached_assets/*` (Vite only; directory does not currently exist) | reserved for static assets bundled into the SPA |
+
+shadcn aliases (in `components.json`) for the CLI: `components → @/components`, `ui → @/components/ui`, `lib → @/lib`, `utils → @/lib/utils`, `hooks → @/hooks`.
 
 ## Where to Add New Code
 
 | Adding a... | Put it in... | Pattern to follow |
-|-------------|--------------|-------------------|
-| New backend HTTP route | `server/routes.ts` inside `registerRoutes()` (`server/routes.ts:855`). | Mirror existing handlers: deadline-bound async (`withDeadline`), return JSON, never throw past the Express error middleware. If the file grows further, see the split-out plan in `CONCERNS.md`. |
-| New scoring signal / risk flag | `server/routes.ts` inside `buildSnapshot()`'s scoring section. | Add the signal to the scoring loop, surface it in `riskFlags` / `opportunityFlags` / `sourceTags`, extend `shared/schema.ts` if the wire shape changes (then both sides see the new field). |
-| New external data source (REST) | New file `server/<provider>.ts` modelled on `server/svs.ts`. | Export typed helpers, never log secrets, wrap every fetch with `fetchWithTimeout`-style abort controllers, expose a config getter, expose a health probe. |
-| New env var | Add to `.env.example` (with comment), read via `process.env.X?.trim()` inside the relevant module. | Document defaults in the same comment block; never prefix with `VITE_`; surface presence (boolean) — never the value — through any health endpoint. |
-| New gRPC watched program | Add `WATCH_<NAME>_PROGRAM` to `.env.example`, extend `loadWatchPrograms()` (`server/grpcStream.ts:94-134`), add the program name to `LAUNCHPAD_NAMES` or `DEX_POOL_NAMES`, update `buildFilters()` if it should land in a new filter group. |
-| New table / DB column | Edit `shared/schema.ts` (Drizzle table + Zod insert schema), update `server/storage.ts` if you need a new method on `IStorage`, run `npm run db:push`. Do **not** add a duplicate `CREATE TABLE` to `server/storage.ts:9-15` — extend the inline statement instead. |
-| New shared type used by both server and client | `shared/schema.ts` (extend an existing Zod schema). Import via `@shared/schema` from both sides. |
-| New page / route in the SPA | Add a `client/src/pages/<name>.tsx` file, register it in `AppRouter()` (`client/src/App.tsx:902`). All routes go through `wouter` with `useHashLocation`. |
-| New presentational component used in multiple places | New file `client/src/components/<name>.tsx` (the `components/` folder currently only has the `ui/` subfolder — create a sibling). Use `cn()` from `@/lib/utils`. Match the shadcn primitive style. |
-| New shadcn primitive | Run `npx shadcn add <name>` so it lands in `client/src/components/ui/`; do not hand-author. Update `components.json` only if you intentionally diverge. |
-| New custom hook | `client/src/hooks/use-<name>.ts(x)`. Mirror the file shape of `use-mobile.tsx` (default-export not used; named-export the hook). |
-| New utility function | `client/src/lib/<name>.ts` (client) or top-of-file in the relevant `server/*.ts` (server). Avoid creating a `server/lib/` until there are 3+ candidates. |
-| New build-time/CLI script | `script/<name>.ts`, ran via `tsx`. Add a corresponding npm script in `package.json`. |
-| New documentation | `docs/<NAME>.md` (operator-facing) or `.planning/codebase/<NAME>.md` (internal Claude-facing context). |
+| --- | --- | --- |
+| New HTTP route | `server/routes.ts` inside `registerRoutes` (`server/routes.ts:855-942`). | `app.get("/api/<name>", async (req, res) => { ... })`; wrap any external work in `withDeadline`; never throw — use `res.status(...).json({ message })`. Add a path-specific summary in `summarizeResponseBody` (`server/index.ts:42-65`) so the access log stays informative. |
+| New scoring signal | `scorePair` in `server/routes.ts:263-423` (or `buildGrpcOnlyToken` for gRPC-only). | Compute the metric with `n()`/`safeString()` defensively, fold it into `velocity`/`virality`/`upside`/`risk` weights, and add a corresponding entry in `riskFlags` or `opportunityFlags`. If it adds a new field on the wire, also extend `tokenSignalSchema` in `shared/schema.ts`. |
+| New external data source | Create a new adapter file `server/<source>.ts` mirroring `server/svs.ts`. | Export narrow typed functions returning `{ ok: true; data: T } | { ok: false; error: string }`. Wrap fetches with an AbortController and a hard-deadline race. Call from `buildSnapshot` and append a `sourceHealth` entry. Never read secret env vars from any client/* file. |
+| New env var | Document in `.env.example`; read in the server module that owns it via `process.env.X?.trim()`. | Group by domain prefix (`SVS_`, `WATCH_`, `ENABLE_`). Provide a sensible default. For booleans use `parseBoolEnv` (`server/grpcStream.ts:80-87`). Surface "configured" status (not the value) on `/api/svs/health` or `/api/grpc/status` if the SPA needs to react. |
+| New gRPC watched program | `loadWatchPrograms()` in `server/grpcStream.ts:94-134`; classify it as launchpad or DEX-pool by adding to `LAUNCHPAD_NAMES` or `DEX_POOL_NAMES` (`server/grpcStream.ts:139-140`). | Add a `pushIf("name", "WATCH_..._PROGRAM", "<defaultId>", enabledFlag)`. If high-volume, gate it behind its own `ENABLE_*` toggle as Raydium AMM v4 is. Document the new env var in `.env.example`. |
+| New DB column | Edit the table definition in `shared/schema.ts:5-9`, then run `npm run db:push`. | Update `IStorage` (`server/storage.ts:19-22`) and `DatabaseStorage` if the new column is read or written. Migrations land in `./migrations` (directory will be created by Drizzle Kit). |
+| New shared type | `shared/schema.ts`. | Define a Zod schema (`*Schema`), export both the schema and `z.infer` type. Import via `@shared/schema` from server and client. Do not duplicate the type into the client; the contract is single-sourced. |
+| New SPA page | `client/src/pages/<name>.tsx` exporting a default React component, then add a `<Route path="/<name>" component={...} />` in `AppRouter` (`client/src/App.tsx:902-909`). | Use the hash router (`useHashLocation`) — paths are `#/something`. Reach data via TanStack Query with key `["/api/..."]`. |
+| New component | Either a new function inside `client/src/App.tsx` (matches the current monolithic pattern) or a new file under `client/src/components/<name>.tsx` if it grows. | PascalCase component name, props typed inline. Use `cn(...)` from `@/lib/utils` for class merging. Reach Tailwind tokens via the existing CSS variables. |
+| New shadcn primitive | `client/src/components/ui/<name>.tsx` via `npx shadcn@latest add <name>` (config in `components.json`). | Keep filenames kebab-case. Do not edit primitives unless deliberately customizing — they are regen targets. |
+| New hook | `client/src/hooks/use-<name>.ts(x)` exporting `useXxx`. | Match the existing kebab-case filename + camelCase identifier pattern (`use-mobile.tsx` → `useIsMobile`). |
+| New utility | `client/src/lib/<name>.ts` for client utilities; for server-only utilities, inline in the owning module or create `server/<name>.ts`. | There is no `server/lib/`; small helpers live next to their callers (e.g. `clamp`, `n`, `safeString`, `mapPool` all live in `server/routes.ts`). |
+| New build script | `script/<name>.ts` and a corresponding entry in `package.json`'s `"scripts"` invoked via `tsx`. | Mirror `script/build.ts`: top-level async `main` with `.catch(err => { console.error(err); process.exit(1); })`. |
+| New doc | `docs/<NAME>.md` for human-authored docs (PRODUCT/ROADMAP/RUNBOOK). | `.planning/codebase/*.md` is reserved for generated codebase mapping — do not hand-edit those. |
 
-## Files NOT Currently Present (worth knowing)
+## Files NOT Currently Present
 
-- No `tests/` or `__tests__/` — no test framework is installed (see `TESTING.md`).
-- No `.eslintrc*` / `.prettierrc*` / `eslint.config.*` / `biome.json` — formatting/linting are not enforced (see `CONVENTIONS.md`).
-- No `.github/workflows/` — no CI; deploys are Railway-on-push.
-- No `attached_assets/` directory despite the `@assets` Vite alias.
-- No `migrations/` directory (Drizzle uses `db:push` rather than checked-in migration files).
-- No `apps/` or `packages/` — this is a single-package repo, not a monorepo.
-
----
+- **No `tests/` directory.** No test files (`*.test.ts`, `*.spec.ts`) anywhere; `tsconfig.json:3` excludes `**/*.test.ts`. There is no test runner in `devDependencies`.
+- **No `.eslintrc` / ESLint config.** The repo relies on `tsc` (`npm run check`) for static analysis. The lone `// eslint-disable-next-line` comments in `server/grpcStream.ts:501,532` are leftovers, not active config.
+- **No `.github/workflows/`.** No CI; deploys are implied to be Railway-driven (per `docs/ARCHITECTURE.md` references) but there are no committed pipeline definitions.
+- **No `migrations/` directory.** Drizzle is configured to write to `./migrations` (`drizzle.config.ts:4`) but the directory only appears the first time `npm run db:push` is run. The schema is also bootstrapped at runtime by the `CREATE TABLE IF NOT EXISTS` in `server/storage.ts:9-15`, so migrations are optional in practice.
+- **No `attached_assets/` directory.** `vite.config.ts:11` aliases `@assets` to it, but it does not exist on disk. Any import from `@assets/*` will fail until the directory is created.
+- **No `Dockerfile` / `Procfile` / `railway.json`.** Deployment configuration is not in the repo.
+- **No `.nvmrc` / `engines` field.** Node version pinning is not enforced (only `@types/node@20.19.27` hints at Node 20).
+- **No README in `.planning/`.** The `.planning/codebase/*.md` files are the generated mapping; there is no index file.
+- **No `prisma/`, no `knex/`, no other ORM.** Drizzle is the only option.
+- **No service-worker / PWA manifest.** The client is a plain SPA.
 
 *Structure analysis: 2026-05-04*
