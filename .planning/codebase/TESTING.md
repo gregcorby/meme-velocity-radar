@@ -1,84 +1,99 @@
 # Testing
 
-**Analysis Date:** 2026-05-04
+This document describes the *current* testing posture (essentially: none) and the seams that would make adding tests easy. It is descriptive of today's state and prescriptive only in the final "Recommendation" section.
+
+---
 
 ## Framework
 
-**Not detected.** No test runner is installed.
+**Searched for:**
 
-Searched for and did not find:
-- `jest` / `@jest/*` / `babel-jest` — not in `package.json`.
-- `vitest` / `@vitest/*` — not in `package.json` (despite Vite being the build tool).
-- `mocha`, `chai`, `ava`, `tap` — not present.
-- `playwright`, `@playwright/test`, `cypress`, `puppeteer` — not present.
-- `@testing-library/react`, `@testing-library/jest-dom`, `@testing-library/user-event` — not present.
-- `supertest` — not present (no integration tests against Express).
-- `msw` (Mock Service Worker) — not present.
+- `find . -name "*.test.*" -not -path '*/node_modules/*'` — **0 matches.**
+- `find . -name "*.spec.*" -not -path '*/node_modules/*'` — **0 matches.**
+- `package.json` deps for `jest`, `vitest`, `playwright`, `cypress`, `@testing-library/*` — **none present** (verified against `package.json:13-105`).
 
-The only hint of intent is in `tsconfig.json:4`:
+**Result: there is no test framework installed and no test files exist.**
 
-```json
-"exclude": ["node_modules", "build", "dist", "**/*.test.ts"]
-```
+Indirect evidence the absence is intentional rather than accidental: `tsconfig.json:3` excludes `**/*.test.ts` from compilation. That exclude is a placeholder for a future framework — when tests are added, `tsc` will not try to compile them as production code.
 
-This excludes `*.test.ts` files from compilation, but no such files exist in the repo. There is no `tests/` or `__tests__/` directory.
+The only enforced quality gate today is `npm run check`, which is a plain `tsc` run (`package.json:10`). It does not execute code; it only verifies types compile under `"strict": true` (`tsconfig.json:9`).
+
+---
 
 ## Structure
 
-**No test files in the repository.** Confirmed via:
-
-- `find . -name "*.test.*" -o -name "*.spec.*" -not -path '*/node_modules/*'` → no results.
-- No `jest.config.*`, `vitest.config.*`, `playwright.config.*`, `cypress.config.*`.
-
-If/when tests are introduced, the conventions to follow (based on the existing codebase shape):
+There are no tests to organize. If tests are introduced, follow the convention table below — it mirrors the repo's existing top-level layout (`server/`, `shared/`, `client/src/`) so the `**/*.test.ts` pattern in `tsconfig.json:3` already covers them.
 
 | Test type | Recommended location | Rationale |
-|-----------|----------------------|-----------|
-| Pure unit (helpers in `server/routes.ts`, `server/svs.ts`) | Co-locate as `server/<file>.test.ts`. The `tsconfig.json` exclude already accommodates this. | Functions like `clamp`, `n`, `safeString`, `firstSentence`, `classifyMeme`, `logNorm`, `withDeadline`, `recordsByMint`, `chunk` are pure and trivially testable. |
-| HTTP route integration | New `tests/integration/` with `supertest` against the real Express app from `registerRoutes()`. | Reuses the actual deadline / fallback / error paths. |
-| gRPC parser unit | `server/grpcStream.test.ts` driving the message parser with captured proto fixtures. | The `any`-isolation boundary makes a fixture-driven test the natural fit. |
-| Client component | `client/src/components/<name>.test.tsx` with Vitest + `@testing-library/react`. | Vitest is the natural pick because the project already uses Vite. |
-| End-to-end | New `e2e/` with Playwright running against `npm run dev`. | The SPA is small (one screen) — a few smoke specs would cover the critical paths. |
+| --- | --- | --- |
+| Server unit (pure helpers) | `server/__tests__/*.test.ts` colocated next to the file under test (e.g. `server/routes.test.ts`) | Keeps the helper and its test in the same import-distance; matches the `tsconfig` exclude pattern. |
+| Server integration (HTTP) | `server/__tests__/api.test.ts` | Boots `registerRoutes` against an in-process Express + supertest. One file per route group (`api.radar`, `api.svs.health`, `api.grpc.status`). |
+| Shared (Zod schemas) | `shared/schema.test.ts` | Schema is the wire contract — tests should live next to it so a schema change forces a test edit in the same diff. |
+| Client unit (hooks / utils) | `client/src/lib/*.test.ts`, `client/src/hooks/*.test.ts` | Matches existing folder layout; jsdom env required. |
+| Client component | `client/src/__tests__/App.test.tsx` | Use `data-testid` selectors that already exist (see "Manual verification" below). |
+| End-to-end | `e2e/*.spec.ts` (top-level) | Out-of-tree from `tsconfig` `include` (`tsconfig.json:2`); needs its own `tsconfig` and runner. |
+
+---
 
 ## Mocking
 
-**No mocking infrastructure detected.** When tests are added, the testable seams already exist:
+There is no mocking library in place. The codebase has, however, been written with several testable seams that can be exercised without monkey-patching globals:
 
-- **External HTTP** — `fetchJson()` and `fetchWithTimeout()` (`server/routes.ts:139`, `server/svs.ts:63`) are the boundary functions; replace with stubs in tests, or use `msw` to intercept at the `fetch` layer (works in Node 20+).
-- **SVS auth-cooldown** — `noteAuthRejected()` and `getSvsAuthCooldown()` (`server/svs.ts:18-35`) are observable; the cooldown timestamp is module-level, so tests need module-reset (`vi.resetModules()`) or a `__resetCooldown()` helper.
-- **gRPC worker** — `getGrpcStatus()` and `getRecentGrpcCandidates()` (`server/grpcStream.ts`) are read-only; the worker itself can be left disabled in tests by leaving `SVS_GRPC_ENDPOINT` unset (`startGrpcWorker()` then returns `{ started: false, reason: ... }`).
-- **Storage** — `IStorage` (`server/storage.ts:19-22`) is the contract; an in-memory `IStorage` impl can be swapped in. Tests should not touch the production `data.db`.
-- **Time** — Several modules read `Date.now()` directly (`server/svs.ts:19`, `server/grpcStream.ts`, `server/routes.ts`). Use `vi.useFakeTimers()` or inject a clock.
+| Seam | Location | How to use |
+| --- | --- | --- |
+| `fetchJson` | `server/routes.ts:139` | The single outbound HTTP helper for DexScreener. Stub by replacing the global `fetch` (Node 20 has it built in) with a test fake; `fetchJson` returns a result object so tests assert on `{ ok, data }` / `{ ok, error }` without try/catch. |
+| `fetchWithTimeout` | `server/svs.ts:63-71` | Same pattern as above for the SVS endpoints. Wraps `fetch` with `AbortController`; injectable by overriding `globalThis.fetch`. |
+| Auth-cooldown state | `server/svs.ts:15-35` | `authRejectedUntil` and `lastAuthRejectStatus` are module-private but observable via `getSvsAuthCooldown()`. Tests can drive the cooldown by calling code paths that hit a 401/403 and then assert the public getter. |
+| `IStorage` interface | `server/storage.ts:19-22` | The `DatabaseStorage` class implements a 2-method interface. Swap it for an in-memory test double in any route-level test by re-binding the `storage` export — or refactor the export to accept a `storage` arg if you want zero-mutation tests. |
+| Time | `Date.now()` is used directly throughout (`server/routes.ts:296, 538, 764`, `server/svs.ts:19, 24`, `server/grpcStream.ts:440, 569-571`) | No central clock abstraction. Use a fake-timers utility (`vi.useFakeTimers()` or jest equivalent) rather than refactoring; the call sites are dense enough that an indirection wouldn't pay back. |
+| gRPC worker module state | `server/grpcStream.ts:543-605` | `startGrpcWorker` / `stopGrpcWorker` / `getGrpcStatus` are the public surface. Tests should drive them through these exports rather than reading the module-private `started`, `status`, `lastError` directly. |
+
+---
 
 ## Coverage
 
-**No coverage data.** No `coverage/`, no `.nyc_output/`, no `vitest.config.ts` with `coverage` block, no badge in README. Add `@vitest/coverage-v8` if you wire Vitest in; or `c8` if you wire `node --test`.
+None. No coverage tooling is installed or configured. There is no coverage threshold in CI because there is no CI test step (see below).
+
+---
 
 ## CI Integration
 
-**No CI test integration.** No `.github/workflows/`, no `.gitlab-ci.yml`, no Makefile target. Tests would currently only run locally.
+None. There is no `.github/workflows/`, no `circleci`, no `gitlab-ci`. The only enforced gate is whatever runs against `npm run check` — i.e. plain TypeScript compilation. If that breaks, types are wrong; nothing else is verified automatically.
 
-When CI is added: the minimum gate that fits this codebase is `npm run check` (which is `tsc --noEmit`). It runs in seconds and would catch every type-level regression. A test job is a follow-up.
+`npm run build` (`package.json:8` -> `tsx script/build.ts`) runs at deploy time on Railway and would fail loudly on a TS error, but it is not a substitute for tests — it never executes route handlers.
+
+---
 
 ## Manual verification (current state)
 
-In place of an automated suite, the project relies on:
+Until automated tests exist, the project relies on these manual checks:
 
-1. **Type check** — `npm run check` → `tsc --noEmit`. The only currently-enforced gate.
-2. **Health endpoints** — `GET /api/svs/health`, `GET /api/grpc/status`, `GET /api/radar` are designed as the operator's verification surface (see `docs/RUNBOOK.md`'s troubleshooting matrix).
-3. **gRPC diagnostics counters** — `/api/grpc/status.diagnostics` (`server/grpcStream.ts:19-29`) intentionally exposes `eventsWithTokenBalances`, `eventsByProgram`, `ignoredReasonCounts`, `parseErrorCount`, etc., specifically so the operator can verify the stream is working without a debugger.
-4. **`data-testid` discipline on the SPA** (`client/src/App.tsx`) — every interactive element has a testid (`button-token-...`, `text-final-score-...`, `badge-opportunity-...`). Adding Playwright/Testing-Library would land on a UI that's already E2E-ready.
-5. **Acceptance criteria in `docs/ROADMAP.md`** — the P0 milestone defines five concrete checks (e.g. "/api/grpc/status.status === connected within 60s of deploy", "container memory flat over 24h"); these are the de-facto integration tests today.
+1. **Type check.** `npm run check` (`package.json:10`). Must be clean before merge. This is the only gate that catches schema-vs-handler drift today, because `shared/schema.ts` types flow through both backend and frontend.
+2. **Health endpoints.** Both must return within their declared deadlines:
+   - `GET /api/svs/health` (`server/routes.ts:856-880`) — wraps `getSvsHealthReport()` in `withDeadline(_, HEALTH_DEADLINE_MS=6_000ms, fallback)` (`server/routes.ts:82, 878`). Must always respond inside ~6s, even if upstream SVS is down.
+   - `GET /api/grpc/status` (`server/routes.ts:882-891`) — synchronous, must be instant. Never awaits the stream.
+   - `GET /api/radar` (`server/routes.ts:893-911`) — bounded by `RADAR_BUILD_DEADLINE_MS=12_000ms` (`server/routes.ts:81, 806`); must return either a fresh snapshot, the cached one, or a degraded `sourceHealth: [{ name: "deadline", status: "degraded", ... }]` object.
+   - `GET /api/radar/stream` (`server/routes.ts:913-939`) — SSE; verify `event: radar` ticks every `REFRESH_SECONDS=20` and that errors arrive as `event: error` rather than closing the connection.
+3. **gRPC diagnostics counters.** Hit `/api/grpc/status` and inspect `diagnostics.eventsByProgram`, `diagnostics.eventsByFilter`, `diagnostics.parseErrorCount`, `diagnostics.lastCandidateAgeSec` (`server/grpcStream.ts:585-595`). Numbers should advance for any program enabled in the watch list (`:94-134`), and `parseErrorCount` should stay near zero on a healthy stream.
+4. **`data-testid` discipline.** Spot-check that every new interactive element has a `data-testid` matching the convention in `CONVENTIONS.md > Naming`. Existing examples: `badge-svs-status`, `badge-grpc-status`, `badge-live-status`, `input-search`, `button-export-csv`, `button-toggle-theme`, `button-token-${id}`, `tab-sort-score` (`client/src/App.tsx:182, 214, 761, 782, 785, 721, 270, 798`). When tests are added, these IDs become the primary selectors — adding them now is a free investment.
+5. **`docs/ROADMAP.md` acceptance criteria.** The P0 milestone "Reliable launchpad-only gRPC ingestion" defines five concrete checks (`docs/ROADMAP.md:18-29`): connected within 60s, candidates within 5min, flat memory over 24h, `eventsPerMinute` in low thousands, `tokens.length > 0` on >99% of `/api/radar` requests, and clean logs. These are the de-facto release-acceptance tests today.
 
-## Recommendation (informational, not normative)
+---
 
-If a single test investment had to be made, **`vitest` + a thin set of unit tests for the scoring helpers in `server/routes.ts` plus a `supertest` smoke for `/api/radar`**. Rationale:
+## Recommendation
 
-1. The scoring functions are the only place where business-logic regressions would silently corrupt the product surface — and they are pure, so they cost little to cover.
-2. `/api/radar` exercises the deadline guard, the stale-fallback path, and the `RadarSnapshot` schema validation in one HTTP call.
-3. Vitest reuses Vite config and TS path aliases (`@/`, `@shared/`) without extra setup.
+*Informational only — no decision has been made to add tests.* If they are introduced, the minimum-viable footprint is **vitest + supertest**:
 
-Document any decision in this file and update `package.json` scripts (`"test": "vitest run"`, `"test:watch": "vitest"`).
+- **vitest.** Reasons: native ESM (matches `package.json:5` `"type": "module"`), TypeScript out of the box (no Babel config), built-in `vi.useFakeTimers()` for the `Date.now()`-based deadline logic in `server/routes.ts` and `server/svs.ts`, jsdom environment for testing the React tree in `client/src/App.tsx`. Vite is already a dep (`package.json:101`), so vitest reuses the existing config.
+- **supertest.** Reasons: `registerRoutes(httpServer, app)` (`server/routes.ts:855`) accepts an Express app, which supertest can boot in-process without binding a port. This makes the four `/api/*` routes straightforward to integration-test against the real `IStorage` (or a swapped-in fake).
+- **What to test first** — the failure modes that today only surface in production logs:
+  1. `withDeadline` returns the fallback when the inner promise hangs (`server/routes.ts:87-114`).
+  2. `fetchJson` returns `{ ok: false, error: "hard deadline ..." }` when the AbortController fires late (`server/routes.ts:148-155`).
+  3. The auth cooldown engages on a synthetic 401 from SVS and short-circuits subsequent calls (`server/svs.ts:18-26`).
+  4. `/api/radar` serves the last-good snapshot when `buildSnapshot` rejects (`server/routes.ts:898-908`).
+  5. `radarSnapshotSchema.safeParse(snapshot)` accepts the actual server output (`shared/schema.ts:101-117`) — guards against silent contract drift.
+
+A test budget of ~30 minutes per round-trip on those five would catch the regressions the codebase is presently architected to prevent.
 
 ---
 
