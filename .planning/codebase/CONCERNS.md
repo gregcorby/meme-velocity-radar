@@ -1,240 +1,141 @@
-# Concerns — Tech Debt, Bugs, Risks
+# Concerns
 
-**Analysis Date:** 2026-05-04
-
-The radar is in a deliberately stable state (`docs/ROADMAP.md` P0 = "stabilise"). The list below is the gap between current and "boring and predictable", grouped by severity.
+The project is in a deliberately stable "P0 stabilise" state per `docs/ROADMAP.md`, so most concerns below are correctness / hygiene issues that the next milestone (P1) will need to clear, not active outages.
 
 ---
 
-## Severity: HIGH
+## HIGH
 
-### H1. Snapshots table grows unbounded — no pruning
+### H1. `radar_snapshots` table grows unbounded (append-only, never pruned)
+**Where:** `server/storage.ts:7-32`, write site `server/routes.ts:766-771`.
+**Problem:** `saveRadarSnapshot` does a plain `INSERT … RETURNING` on every successful `buildSnapshot`. There is no `DELETE`, no `LIMIT`, no upsert, and no scheduled prune. Each row stores the full JSON `payload` (`scannedTokens` plus up to 24 `tokens` plus `metas`, typically 50–200KB per row per `summarizeResponseBody` evidence in `server/index.ts:42-65`). With `REFRESH_SECONDS = 20` (`server/routes.ts:76`) the cache opens the door to a write per ~25s under any pull traffic, and `/api/radar/stream` calls `buildSnapshot(true)` on every tick (`server/routes.ts:921-934`).
+**Impact:** On a default Railway container the SQLite file grows by hundreds of MB per day with light traffic and several GB per day under SSE load, which violates P0 acceptance criterion #3 ("container memory stays flat … no Railway restart"). It will also make `getLatestRadarSnapshot()` (`ORDER BY id DESC LIMIT 1`) slower over time because the table scan walks an ever-larger B-tree page set.
+**Fix:** Either (a) keep one row using `INSERT OR REPLACE INTO radar_snapshots(id, captured_at, payload) VALUES (1, ?, ?)` and treat the table as a single-row cache, or (b) keep the append-only design but add a TTL cleanup at write time: `DELETE FROM radar_snapshots WHERE id < (SELECT max(id) - 200 FROM radar_snapshots)`. Run `VACUUM` on startup after pruning to actually reclaim disk.
 
-**Where:** `server/storage.ts:25-31`, `shared/schema.ts:5-9`.
+### H2. `/api/radar`, `/api/radar/stream`, `/api/grpc/status`, `/api/svs/health` have no rate limiting, no auth, no `Cache-Control`
+**Where:** `server/routes.ts:856-941`. No middleware in `server/index.ts:9-89`.
+**Problem:** All four routes are world-readable with zero protection. `/api/radar/stream` opens an SSE connection that triggers `buildSnapshot(true)` (forced cache bypass) every `REFRESH_SECONDS * 1000`ms (`server/routes.ts:934`) and **does not** route through the in-flight coalescer `buildSnapshotWithDeadline` (`server/routes.ts:787-805`). Every additional SSE client therefore launches its own concurrent fan-out of 4 DexScreener calls + SVS metadata/price/mint_info + up to 14 pair lookups. The non-stream `/api/radar` returns no `Cache-Control` header at all, so intermediaries (and the browser) treat responses as freely cacheable while the dataset is actually live.
+**Impact:** A single curl loop or N tabs will saturate the DexScreener allowance, push the SVS API into the 401/403 cooldown (`server/svs.ts:14-21`), and exhaust the 12s `RADAR_BUILD_DEADLINE_MS`. Status endpoints can also be used as cheap unauthenticated probes for whether the operator has SVS keys installed (`hasToken`, `endpointConfigured`, `watchedPrograms` are all returned).
+**Fix:** Add `express-rate-limit` keyed on `req.ip` with a tight window for `/api/radar*` (e.g. 10 req/min) and a looser window for status routes. Set `Cache-Control: no-store` on `/api/radar` and `/api/radar/stream`, `Cache-Control: max-age=10` on `/api/grpc/status`, and `Cache-Control: max-age=30` on `/api/svs/health`. Make `/api/radar/stream` reuse `buildSnapshotWithDeadline(false)` instead of `buildSnapshot(true)` so multiple SSE clients share work, and cap simultaneous SSE connections (drop with 503 if a counter exceeds 5). If exposure must stay public, at least strip `watchedPrograms` from `getGrpcStatus()` before returning over the wire.
 
-**Problem:** Every successful `/api/radar` build appends a row to `radar_snapshots` (with `payload` = the full JSON snapshot, typically 50–200 KB). The table is never pruned. Only the latest row is ever queried (`getLatestRadarSnapshot()` does `orderBy(desc(id)).limit(1)`). At a 20 s refresh that is 4,320 inserts/day → ~430 MB/day of SQLite growth, all of it dead weight. On a small Railway container this exhausts disk within days.
+### H3. `script/build.ts` allowlist is wildly out of sync with `package.json`
+**Where:** `script/build.ts:7-31`; cross-reference `package.json:13-104`.
+**Problem:** The `allowlist` lists 23 packages to bundle into `dist/index.cjs`. Of those, **13 are not declared anywhere in `package.json`**: `@google/generative-ai`, `axios`, `cors`, `express-rate-limit`, `jsonwebtoken`, `multer`, `nanoid`, `nodemailer`, `openai`, `stripe`, `uuid`, `xlsx`. Conversely, several declared and actually-used server deps are *not* on the allowlist, so they ship as `external` and are loaded via `require()` at runtime: `@triton-one/yellowstone-grpc`, `better-sqlite3`, `bs58`, `dotenv`. Worse: `nanoid` is genuinely imported in `server/vite.ts:7` (used only in dev) but is not a declared dependency — it currently resolves only as a transitive of vite/drizzle-kit and will silently break if either drops it.
+**Impact:** Build succeeds because esbuild treats unknown allowlist entries as no-ops, but the comment at line 5 ("bundle to reduce openat(2) syscalls / cold start") is a lie — the things the comment cares about (gRPC, sqlite, dotenv) are still external. Future maintainers copying this file will silently bundle nothing useful. Bundling `bs58` and `dotenv` would make a measurable difference on Railway cold starts.
+**Fix:** Replace the allowlist with the actual server runtime imports. Concretely: include `dotenv`, `bs58`, `drizzle-orm`, `drizzle-zod`, `express`, `ws`, `zod`, `zod-validation-error`, `date-fns`. Keep `@triton-one/yellowstone-grpc` and `better-sqlite3` external (they ship native bindings that esbuild cannot bundle). Add `nanoid` to `dependencies` in `package.json` (or replace the cache-buster in `server/vite.ts:49` with `Date.now().toString(36)`). Delete every allowlist entry whose package is not in `package.json` so the file is self-validating.
 
-**Impact:** Disk OOM on long-running deploys; slower `INSERT` over time as the WAL grows; backups become unwieldy.
+### H4. ~10 unused but installed dependencies; auth/session stack carries no implementation
+**Where:** `package.json:13-80`.
+**Problem:** Greps across `server/`, `client/src/`, `shared/`, `script/` show zero imports for: `@hookform/resolvers`, `@supabase/supabase-js`, `framer-motion`, `next-themes`, `react-icons`, `passport`, `passport-local`, `express-session`, `memorystore`. The Passport + express-session + memorystore trio implies a session/auth subsystem that does not exist; nothing in `server/index.ts` mounts session middleware. `@supabase/supabase-js` is a 500KB+ runtime that is not referenced.
+**Impact:** ~3-5MB of `node_modules` bloat, slower CI installs, and a confusing surface area for a new contributor who will reasonably assume there is an auth path to wire into. It also enlarges the supply-chain attack surface by ~10 packages plus their transitives. The presence of `passport-local` is particularly misleading because H2 above flags the API as unauthenticated.
+**Fix:** Remove from `package.json`: `@hookform/resolvers`, `@supabase/supabase-js`, `framer-motion`, `next-themes`, `react-icons`, `passport`, `passport-local`, `@types/passport`, `@types/passport-local`, `express-session`, `@types/express-session`, `memorystore`. Run `npm install` and commit the lockfile delta. If auth lands later, add it back deliberately. Keep `recharts`, `wouter`, `cmdk`, `embla-carousel-react`, `vaul`, `react-day-picker`, `input-otp`, `react-hook-form`, `react-resizable-panels` — they are all imported by `client/src/components/ui/*`.
 
-**Fix:** Either (a) add a `DELETE FROM radar_snapshots WHERE id < (SELECT MAX(id) - K)` after each insert (keep the last K snapshots, e.g. K = 50), or (b) flip `saveRadarSnapshot` to an UPSERT on a single fixed-id row. Option (b) is the cleaner fit because the table is already used as a single-row cache. If you ever want a time-series, that's a different table with retention from day one.
+### H5. SSE handler bypasses the in-flight coalescer and has no heartbeat or backpressure
+**Where:** `server/routes.ts:913-939`.
+**Problem:** The handler calls `buildSnapshot(true)` directly (line 924) instead of `buildSnapshotWithDeadline(false)`, so each SSE client triggers an independent forced rebuild every 20s; the `inflightSnapshot` deduplication only protects `/api/radar`. There is also no SSE heartbeat (`: keepalive\n\n` comment), so proxies and Cloudflare-style edges will silently drop the connection after their idle timeout. There is no backpressure check on `res.write()` — under a slow client, the Node socket buffer can grow unbounded. Finally, if `buildSnapshot` rejects, the error path writes an `event: error` frame but does not close the connection, so a persistently failing upstream produces an error frame every 20s forever.
+**Impact:** Multiplies upstream API cost linearly with SSE clients, makes the stream brittle behind any reverse proxy, and leaks memory under slow consumers. Combined with H2 (no rate limiting, no client cap), one badly-behaved client can degrade the whole worker.
+**Fix:** (a) Replace `buildSnapshot(true)` with `buildSnapshotWithDeadline(false)`; the existing 20s polling already provides freshness. (b) Send a `: ping\n\n` comment every 15s. (c) Track `res.writableNeedDrain` and skip a tick when true. (d) After 3 consecutive errors, write a final frame, call `res.end()`, and stop the interval. (e) Add a module-level `Set<Response>` of active streams capped at 5 and reject the 6th with 503.
 
----
-
-### H2. `/api/radar` and `/api/radar/stream` have no rate limit, no cache key, no auth
-
-**Where:** `server/routes.ts:893-911` (`/api/radar`), `server/routes.ts:913-939` (`/api/radar/stream`).
-
-**Problem:** A public radar URL on Railway is hit by anyone who finds it. Both endpoints proxy DexScreener and SVS. There is:
-- No `express-rate-limit` (the package is in the `script/build.ts` allowlist but not in `package.json`).
-- No CDN / cache header on `/api/radar` — every request is a fresh build (mitigated by the 25 s in-process `memoryCache`, but the cache key does not differentiate `?force=1` correctly: any caller passing `force=1` bypasses the cache for everyone).
-- No IP/per-key throttle on the SSE stream — N open EventSource connections all push every 20 s.
-
-**Impact:** A single bored user holding 100 SSE tabs open will keep the server permanently building snapshots; if DexScreener rate-limits us we lose the fallback path entirely.
-
-**Fix:** Add `express-rate-limit` to `package.json`, apply a global limit on `/api/*`, and add a per-IP cap on `/api/radar/stream` concurrent connections. Add `Cache-Control: public, max-age=15` on `/api/radar` for non-`force` calls.
-
----
-
-### H3. Build-script allowlist references packages not installed
-
-**Where:** `script/build.ts:7-31`.
-
-**Problem:** The `allowlist` (deps that get bundled into `dist/index.cjs`) lists 21 packages, but only 9 are present in `package.json` dependencies. The missing entries — `@google/generative-ai`, `axios`, `cors`, `express-rate-limit`, `jsonwebtoken`, `multer`, `nodemailer`, `openai`, `stripe`, `uuid`, `xlsx`, `nanoid` — appear to be scaffold residue from another project. The build still succeeds because esbuild silently treats absent allowlist entries as "no override" (everything not present in `package.json` is automatically external by virtue of the filter). However:
-
-- The list is misleading documentation. A reader will assume those packages are deliberately bundled.
-- If `script/build.ts` is ever changed to throw on unknown allowlist entries, the build breaks.
-- It hides what is actually bundled — the real bundled set is the **intersection** of the allowlist with `package.json` deps.
-
-**Fix:** Replace the hard-coded allowlist with the actual list of deps you want bundled, computed against `package.json` at build time. Or document why the historical list is left in place (and add a check that warns on misses).
+### H6. `inflightSnapshot` reset uses `setImmediate`, which can wedge the deadline-fallback path
+**Where:** `server/routes.ts:787-805`.
+**Problem:** When a `buildSnapshot` exceeds `RADAR_BUILD_DEADLINE_MS` (12s), the wrapping `withDeadline` resolves to a cached fallback, **but `inflightSnapshot` is still pointing at the slow-running build**. Every subsequent caller within that build's lifetime races onto the same `inflightSnapshot` promise and immediately hits the deadline path again, so the user sees the "deadline" `sourceHealth` line for tens of seconds even though the actual build will eventually succeed. The reset only happens via `setImmediate` after the build settles, not when the deadline fires.
+**Impact:** Under a single slow DexScreener fetch, the dashboard shows degraded snapshots for the full duration of the slow upstream rather than just one cycle. This violates the "stale-while-rate-limited" UX the cache was supposed to provide.
+**Fix:** Track build start time and let `buildSnapshotWithDeadline` start a fresh build when `Date.now() - startedAt > RADAR_BUILD_DEADLINE_MS` even if `inflightSnapshot` is non-null. Alternatively, in the `withDeadline` `onTimeout` callback, also clear `inflightSnapshot` so the next caller can start a new build (the old promise's eventual `setImmediate` reset becomes a harmless no-op).
 
 ---
 
-### H4. Unused dependencies pulled in by scaffold (auth, Supabase, Pump-related deps)
+## MEDIUM
 
-**Where:** `package.json` dependencies; not imported anywhere in `server/` or `client/`.
-
-- `passport` 0.7.0, `passport-local` 1.0.0, `@types/passport*` — auth scaffolding.
-- `express-session` 1.18.1 + `memorystore` 1.6.7 — session scaffolding.
-- `@supabase/supabase-js` 2.49.4 — Supabase client.
-- `framer-motion` 11.13.1 — barely used.
-- `recharts` 2.15.2 — chart library; minimal usage.
-- `embla-carousel-react`, `react-day-picker`, `react-resizable-panels`, `vaul`, `cmdk`, `input-otp`, `react-icons`, `next-themes`, `tw-animate-css`, `@tailwindcss/vite` — shadcn-pulled but not all referenced.
-
-**Impact:** Larger `node_modules` (slows Railway builds), larger lockfile, broader supply-chain attack surface, version-bump churn for code you don't run.
-
-**Fix:** Audit each, remove or actually-use. `npx depcheck` would surface the full set. Removing the auth set (passport/express-session/memorystore) is the highest-leverage quick win — none of it is wired and it's the most invasive scaffolding to keep around.
-
----
-
-## Severity: MEDIUM
-
-### M1. `client/src/App.tsx` is 924 lines in one file
-
-**Where:** `client/src/App.tsx`.
-
-**Problem:** Every component (`Logo`, `SvsBadge`, `GrpcBadge`, `ScorePill`, `TokenAvatar`, `TokenCard`, `DetailPanel`, `MetaRail`, `SnapshotBar`, `RadarHome`, `AppRouter`, `App`), every formatter (`fmtMoney`, `fmtPct`, `fmtAge`, `scoreTone`, `riskTone`, `trendIcon`, `normalizeChart`), the `exportCsv` helper, and the `RadarHome` page state all live in one file. The component graph is shallow but the file is at the point where every change carries a wide blast radius.
-
-**Impact:** Slows every UI change; merge conflicts; impossible to lazy-load any part of the page; React Refresh boundaries are coarse.
-
-**Fix:** Split per existing structure cue:
-- `client/src/components/header/SvsBadge.tsx`, `GrpcBadge.tsx`, `Logo.tsx`
-- `client/src/components/radar/TokenCard.tsx`, `TokenAvatar.tsx`, `ScorePill.tsx`, `DetailPanel.tsx`, `MetaRail.tsx`, `SnapshotBar.tsx`
-- `client/src/lib/format.ts` for `fmtMoney/fmtPct/fmtAge/scoreTone/riskTone/trendIcon/normalizeChart`
-- `client/src/lib/csv.ts` for `exportCsv`
-- `client/src/pages/Radar.tsx` for `RadarHome`
-- `App.tsx` keeps only theme + providers + router.
-
-Treat as a multi-step refactor; do one component at a time so PRs stay reviewable.
-
----
-
-### M2. `server/routes.ts` is 942 lines with three responsibilities
-
-**Where:** `server/routes.ts`.
-
-**Problem:** The file mixes (a) the DexScreener fetcher, (b) the per-token scoring + meme-narrative classifier, and (c) the HTTP route handlers. The scoring code (`scorePair`, `classifyMeme`, `firstSentence`, `buildLinks`) is the most product-critical logic in the repo and is buried in the same file as the SSE handler.
-
-**Fix:** Extract:
-- `server/dexscreener.ts` for `fetchJson`, the trending/profiles/boosts fetchers, the result-object types.
-- `server/scoring.ts` for `scorePair`, `classifyMeme`, `firstSentence`, `buildLinks`, `logNorm`, `getTxns`, `getVolume`, `getChange`.
-- `server/snapshot.ts` for `buildSnapshot`, `buildSnapshotWithDeadline`, `withDeadline`, the cache + single-flight state.
-- `server/routes.ts` keeps only `registerRoutes()` and the route handlers themselves.
-
----
-
-### M3. `EVENT_BASE`/`API_BASE` placeholder string is fragile
-
+### M1. `__PORT_5000__` placeholder branch is dead code with a misleading name
 **Where:** `client/src/lib/queryClient.ts:3`, `client/src/App.tsx:49`.
+**Problem:** Both files compute `const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__"`. The literal `"__PORT_5000__"` always starts with `__`, so the ternary unconditionally evaluates to `""`. The branch that returns the placeholder is unreachable. Whatever tool was supposed to substitute this token (looks like a Replit deploy artefact) is not part of this codebase.
+**Impact:** New maintainers see two distinct constants (`API_BASE` vs `EVENT_BASE`) and assume there is a configurable base URL, when in fact both are hard-coded to "" (same-origin). The name `EVENT_BASE` for an SSE endpoint is also confusing because it suggests a separate origin.
+**Fix:** Replace both with `const API_BASE = ""` (or import it from a shared `client/src/lib/config.ts`). Delete `EVENT_BASE` and use `API_BASE` directly in the `EventSource` call. If a configurable base is genuinely wanted later, read `import.meta.env.VITE_API_BASE` once and document it in `.env.example`.
 
-```ts
-const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
-const EVENT_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
-```
+### M2. `client/src/App.tsx` is a 924-line monolith
+**Where:** `client/src/App.tsx:1-924`.
+**Problem:** The file contains the router, theme hook, formatters (`fmtMoney`, etc.), CSV exporter, sidebar, header, multiple cards, `RadarHome`, the SSE wiring, and the detail sheet — 100+ functions/consts in a single file. There are no tests and no smaller surface area to import for storybook-style review.
+**Impact:** Every change touches the same file, making review painful and turning the file into a merge-conflict magnet. Tree-shaking is fine because Vite handles it, but cognitive load is the real cost.
+**Fix:** Split into `client/src/App.tsx` (router only), `client/src/pages/RadarHome.tsx`, `client/src/lib/format.ts` (`fmtMoney`, `fmtPercent`, `compactUrlLabel`), `client/src/lib/exportCsv.ts`, `client/src/components/Sidebar.tsx`, `client/src/components/Header.tsx`, `client/src/components/TokenDetailSheet.tsx`, `client/src/hooks/useTheme.ts`, `client/src/hooks/useRadarStream.ts`. Aim for ~150 lines/file.
 
-**Problem:** This pattern relies on a build-time string substitution that never happens — there is no Vite `define`, no `replace` plugin, nothing in `script/build.ts` or `vite.config.ts` that rewrites `"__PORT_5000__"`. The runtime value is always `""`, which happens to be correct for same-origin deployments, but the dead-code conditional is misleading and will silently no-op if someone tries to "fix" it.
+### M3. `server/routes.ts` is a 942-line god-file mixing scoring, fetching, caching, and HTTP
+**Where:** `server/routes.ts:1-942`.
+**Problem:** The file holds DexScreener client code, scoring heuristics (`scorePair` 160 lines), gRPC-only token fabrication (`buildGrpcOnlyToken`), the snapshot builder, the deadline wrapper, the in-flight coalescer, **and** the route handlers. Pure scoring logic cannot be unit-tested without spinning up Express. Module-level mutable state (`memoryCache`, `lastGoodSnapshot`, `inflightSnapshot`) is interleaved with stateless helpers.
+**Impact:** Hard to add unit tests for the scoring math (the most decision-critical code in the project) without also stubbing fetch and storage. Large surface area for regressions.
+**Fix:** Extract `server/scoring.ts` (`scorePair`, `buildGrpcOnlyToken`, `classifyMeme`, `firstSentence`, `compactUrlLabel`, `clamp`, `n`, `safeString`, `logNorm`), `server/dexscreener.ts` (`fetchJson`, `mapPool`, `DEX` constant), `server/snapshot.ts` (`buildSnapshot`, `buildSnapshotWithDeadline`, cache state). Keep `server/routes.ts` under 200 lines of HTTP wiring.
 
-**Impact:** Future contributor wastes time hunting for the substitution mechanism; a copy-paste of the pattern into a real cross-origin scenario will silently use `""` and break.
+### M4. `data.db` path is relative — depends on cwd
+**Where:** `server/storage.ts:7`, `drizzle.config.ts:8`.
+**Problem:** `new Database("data.db")` resolves relative to `process.cwd()`. In `npm run dev` and `npm start` (`package.json:7-9`) this happens to be the repo root, but any deployment that `cd`s elsewhere (or any future systemd unit / Docker `WORKDIR` change) will silently create a fresh empty database next to the new cwd. The previous database becomes orphaned but is not deleted, so two databases can coexist.
+**Impact:** Lost history on path changes; confusing debugging when "the snapshot persists locally but not on Railway". Also makes it impossible to put the DB on a mounted persistent volume without a path override.
+**Fix:** Read `process.env.DATABASE_PATH` with a default of `path.resolve(import.meta.dirname, "..", "data.db")` and use that in both `server/storage.ts` and `drizzle.config.ts`. Document the env var in `.env.example`.
 
-**Fix:** Replace with `import.meta.env.VITE_API_BASE_URL ?? ""`. Document that the SPA defaults to same-origin and you only need to set the var if hosting frontend separately. The `VITE_` prefix is safe here because the value is a public URL, not a secret.
-
----
-
-### M4. Hash-based routing with only one real page
-
-**Where:** `client/src/App.tsx:902`, `client/src/main.tsx:5-7`.
-
-**Problem:** The router uses `wouter`'s hash adapter and there is exactly one route plus the 404. Hash routing is required because `vite.config.ts` uses `base: "./"` (relative paths) and the static-serve fallback at `server/static.ts:17` always serves `index.html` for any unmatched path — so any path-based route would still work, but the hash adapter is in there as belt-and-braces. This is fine until you add deep links: SEO, link previews, and copy-paste-able routes will all break under hash routing.
-
-**Impact:** Future "share this token" feature will need to switch to history routing, which means changing `base`, the static fallback, and possibly Railway's URL handling.
-
-**Fix:** Note the constraint in `STRUCTURE.md` (already done). When deep links become a P1, switch to `wouter`'s default browser-history adapter and set `base` to `/` in `vite.config.ts`.
-
----
-
-### M5. SQLite path is hard-coded to `./data.db`
-
-**Where:** `server/storage.ts:7` (`new Database("data.db")`), `drizzle.config.ts:7-9`.
-
-**Problem:** The path is a string literal, resolved relative to the cwd. On Railway this happens to be the project root, which works. If the server is ever started from a different directory, or if the deployment splits build dir vs runtime dir, the database will be created in the wrong place and the radar will look like a fresh deploy with no snapshot history (which silently breaks the stale-fallback path).
-
-**Impact:** Production silently loses the stale-fallback safety net.
-
-**Fix:** Read from env (`process.env.DATA_DB_PATH ?? "./data.db"`). Keep the default but make it overridable. Document in `RUNBOOK.md` and `.env.example`.
-
----
-
-### M6. `data.db-journal` listed in `.gitignore` but WAL mode produces `-wal`/`-shm` only
-
-**Where:** `.gitignore`, `server/storage.ts:8` (`pragma("journal_mode = WAL")`).
-
-**Problem:** Minor — `data.db-journal` is the rollback-journal mode artifact; in WAL mode you get `data.db-wal` and `data.db-shm` instead. Both are in the `.gitignore` already, so this is documentation drift, not a leak risk.
-
-**Fix:** Remove `data.db-journal` from `.gitignore` (or keep it — it's defensive, costs nothing).
-
----
-
-### M7. `attached_assets` Vite alias points to a non-existent directory
-
+### M5. `@assets` vite alias points to a directory that does not exist
 **Where:** `vite.config.ts:11`.
+**Problem:** `"@assets": path.resolve(import.meta.dirname, "attached_assets")` — but `attached_assets/` is not present in the repo. Likely a leftover from a Replit template. No file imports from `@assets`, so the build does not fail, but the alias is a tripwire: someone will eventually `import logo from "@assets/logo.png"`, get a confusing "file not found" error, and waste time figuring out the alias is stale.
+**Impact:** Latent footgun; minor cognitive cost.
+**Fix:** Delete the `@assets` alias from `vite.config.ts:11`. If assets land later, create `client/src/assets/` and rely on the standard `@/assets/...` path via the existing `@` alias.
 
-**Problem:** `"@assets": path.resolve(import.meta.dirname, "attached_assets")` — but `attached_assets/` does not exist. Imports through `@assets/...` will produce a confusing "file not found" rather than a clear "no such alias".
+### M6. No `unhandledRejection` / `uncaughtException` handler; DB write failures are swallowed silently
+**Where:** `server/index.ts:1-147`, `server/routes.ts:766-771`.
+**Problem:** The Express error middleware (`server/index.ts:94-105`) only catches errors propagated through Express. The gRPC worker runs in a fire-and-forget `void runStreamLoop(...)` (`server/grpcStream.ts:557`); any rejection inside that escapes the inner try/catch becomes an unhandled rejection. The fire-and-forget `storage.saveRadarSnapshot(...).catch(() => undefined)` silences DB write failures completely — a corrupt or full disk produces no log line.
+**Impact:** Silent failures in two of the most important async paths (DB writes and the gRPC worker). Future Node versions terminate on unhandled rejection by default, which would crash the server.
+**Fix:** In `server/index.ts`, register `process.on("unhandledRejection", (reason) => log(...))` and `process.on("uncaughtException", (err) => log(...))` immediately after the dotenv import. Replace the silent `.catch(() => undefined)` in `server/routes.ts:771` with `.catch((err) => log("snapshot persist failed: " + err.message, "storage"))`.
 
-**Fix:** Either create the directory and add a `.gitkeep`, or remove the alias.
-
----
-
-## Severity: LOW
-
-### L1. `bs58` 6.0.0 import at top of `grpcStream.ts` — value of import is dynamic later
-
-**Where:** `server/grpcStream.ts:9`.
-
-**Problem:** `import bs58 from "bs58"` is loaded eagerly even when `SVS_GRPC_ENDPOINT` is unset and the worker is disabled. Tiny memory cost; not worth fixing on its own.
-
-**Fix:** None. Note for the record.
-
----
-
-### L2. `console.error` in gRPC parse path is unbounded
-
-**Where:** `server/grpcStream.ts:502` (`console.error("[grpc] update parse error:", error)`), `server/grpcStream.ts:533` (stream error).
-
-**Problem:** A malformed proto from upstream could log per-event indefinitely. `parseErrorCount` is in `diagnostics`, but the raw error is also `console.error`'d, which defeats the "compact logs" pattern set elsewhere.
-
-**Fix:** Rate-limit these logs (e.g. log the first error, then once per minute). Or drop the per-event log entirely and rely on the diagnostics counter.
+### M7. `parseInt(process.env.PORT, 10)` accepts garbage and binds to NaN
+**Where:** `server/index.ts:121`.
+**Problem:** `parseInt("abc", 10)` returns `NaN`, and `httpServer.listen({ port: NaN, host: ... })` throws asynchronously inside Node's libuv layer with a confusing message. There is no validation that `PORT` is a positive integer in `[1, 65535]`.
+**Impact:** Misconfigured `PORT` env produces a boot-time crash with a misleading stack trace.
+**Fix:** `const port = (() => { const raw = process.env.PORT; if (!raw) return 5000; const n = Number(raw); if (!Number.isInteger(n) || n < 1 || n > 65535) throw new Error(\`invalid PORT: \${raw}\`); return n; })();`
 
 ---
 
-### L3. `.env` file presence is checked implicitly by `dotenv/config`
+## LOW
 
-**Where:** `server/index.ts:1`.
+### L1. `console.error` in gRPC parser hot path is uncapped
+**Where:** `server/grpcStream.ts:498-504`, also `server/grpcStream.ts:533`.
+**Problem:** `processTransactionUpdate` increments `parseErrorCount` and prints `[grpc] update parse error:` for every failed parse, with no rate limit or sampling. Under a malformed-update flood (or a yellowstone proto change) this can produce thousands of lines per minute and push the Railway log pipeline over its rate limit, which then drops *useful* logs too. The reconnect log on line 533 has the same issue if the stream flaps.
+**Impact:** Log-volume DoS in the worst case; otherwise just noise. The diagnostics counter `parseErrorCount` already provides aggregate visibility.
+**Fix:** Throttle to one log per 60s: `if (Date.now() - lastParseErrorLogAt > 60_000) { console.error(...); lastParseErrorLogAt = Date.now(); }`. Keep the counter increment outside the throttle so the diagnostic stays accurate.
 
-**Problem:** `dotenv/config` silently no-ops when `.env` is absent. In production this is correct (Railway injects via environment); in dev a missing `.env` produces a radar with all SVS features disabled, which is functional but easy to misdiagnose as "broken".
+### L2. SQLite WAL `.gitignore` lists the wrong sidecar file
+**Where:** `.gitignore:6-9`, `server/storage.ts:8`.
+**Problem:** The code sets `journal_mode = WAL` (`server/storage.ts:8`), so the actual sidecar files at runtime are `data.db-shm` and `data.db-wal`. `data.db-journal` (the rollback-journal file) is not produced in WAL mode. The `.gitignore` line for it is harmless but misleading. Also missing: a wildcard like `data.db-*` that would defend against future SQLite versions adding new sidecar suffixes.
+**Impact:** None today; cosmetic and confusing.
+**Fix:** Replace lines 6-9 with two lines: `data.db` and `data.db-*`. Delete the `data.db-journal` entry. Add a comment that the wildcard covers `-wal`, `-shm`, and any future SQLite sidecars.
 
-**Fix:** On dev boot, log which optional features are disabled because their env var is missing. The shape already exists in `getSvsConfig()` (`server/svs.ts:47-55`); just log the booleans on startup.
+### L3. CSV export double-quotes every cell, including raw numbers
+**Where:** `client/src/App.tsx:597-626`.
+**Problem:** `row.map((cell) => \`"${String(cell).replaceAll('"', '""')}"\`)` quotes everything. RFC 4180 permits this but Excel and Google Sheets then treat the numeric columns (`market_cap`, `liquidity`, `volume_*`) as text by default, so spreadsheet sorting breaks until the user manually re-types each column.
+**Impact:** Mild UX papercut for the CSV export feature.
+**Fix:** Quote only when the cell contains `"`, `,`, `\n`, or starts/ends with whitespace: `const needsQuote = /[",\n\r]/.test(s) || /^\s|\s$/.test(s); return needsQuote ? \`"${s.replaceAll('"', '""')}"\` : s;`. Numeric columns will then export unquoted.
 
----
+### L4. `dangerouslySetInnerHTML` in the chart theme injector is not currently exploitable but lacks defensive escaping
+**Where:** `client/src/components/ui/chart.tsx:81`.
+**Problem:** The shadcn chart component generates a `<style>` block via `dangerouslySetInnerHTML` from a `colorConfig` object whose values are passed into a CSS-variable string. The values are not user input today, but if a future caller passes a token symbol or other server-derived string into the chart config, that string will land inside `<style>` with no escaping.
+**Impact:** Latent XSS if untrusted strings ever reach the chart config. Not currently exploitable because no caller does that.
+**Fix:** Whitelist allowed CSS-color characters before interpolation: `const safe = (v: string) => v.replace(/[^a-zA-Z0-9#().,%\\s-]/g, "")`. Apply it to every value before composing the style block.
 
-### L4. `Pump.fun` watcher has no default program ID
-
-**Where:** `server/grpcStream.ts:111` — `pushIf("pumpfun", "WATCH_PUMPFUN_PROGRAM", undefined, true)`.
-
-**Problem:** The watcher is "enabled" but there's no fallback program ID, so it does nothing unless the operator finds and pastes the program ID. This matches `docs/PRODUCT.md`'s "Partial — wired, watcher disabled by default" note.
-
-**Fix:** Either bake in a known Pump.fun program ID with a comment ("verify before enabling on a sized host"), or log a one-line "pumpfun watcher idle: WATCH_PUMPFUN_PROGRAM not set" on startup so the operator knows the wiring is intentional.
-
----
-
-### L5. Image `crossOrigin="anonymous"` on every external token image
-
-**Where:** `client/src/App.tsx:247`.
-
-**Problem:** `crossOrigin="anonymous"` makes the browser drop credentials but also requires the upstream to send `Access-Control-Allow-Origin`. If DexScreener / SVS / IPFS gateways do not set CORS headers, the image fails — but the `onError` fallback already handles that, so it's defensive.
-
-**Fix:** Probably none. Worth noting that adding a backend image proxy would let us strip `crossOrigin`, control caching, and avoid hot-linking.
-
----
-
-### L6. CSV export uses naive escaping
-
-**Where:** `client/src/App.tsx:597-625` (`exportCsv`).
-
-**Problem:** Naive CSV building rarely handles fields containing commas, quotes, or newlines correctly. Token names can contain any of these; a malicious token name with an embedded `=cmd|...` would also be a CSV-injection vector when opened in Excel.
-
-**Fix:** Use a tiny CSV escape helper (`"${value.replace(/"/g, '""')}"`) and prefix any cell starting with `=`/`+`/`-`/`@` with a single quote. ~10 lines.
+### L5. `WATCH_PROGRAMS` is evaluated at module import time, coupling correctness to import order
+**Where:** `server/grpcStream.ts:136`, `server/index.ts:1-7`.
+**Problem:** `WATCH_PROGRAMS = loadWatchPrograms()` runs the moment `server/grpcStream.ts` is parsed. This works only because `server/index.ts` imports `dotenv/config` *before* importing `./grpcStream`, so `process.env.WATCH_*` is populated in time. If anyone reorders the imports, `WATCH_PROGRAMS` will silently load with empty values and the worker will report `no watched programs configured`.
+**Impact:** Silent misconfiguration on import-order changes; tests that try to set env per-case cannot do so without re-importing.
+**Fix:** Move `WATCH_PROGRAMS` evaluation inside `startGrpcWorker` (compute on first call, cache to a module-level `let`). That removes the import-order coupling and lets tests pass alternate env without a process restart.
 
 ---
 
 ## Things checked and clean
 
-- **No `TODO` / `FIXME` / `HACK` / `XXX` markers** in `server/*.ts`, `client/src/App.tsx`, `script/build.ts`, `shared/schema.ts`. The team uses commit messages and `docs/ROADMAP.md` to track work.
-- **No hardcoded secrets** in source. `.env.example` only has placeholders, and the actual `.env` is gitignored.
-- **No `eval` / `Function(...)`** in source.
-- **No `process.exit(...)` outside the build script and the Vite logger error path** (which terminates intentionally on dev-vite startup failure, `server/vite.ts:25`).
-- **No `any` leak from `grpcStream.ts`** — the file isolates wide `any` types and emits `GrpcCandidate` (well-typed) for the rest of the app.
-- **No SQL string concatenation** — all DB access goes through Drizzle's typed query builder.
-- **No `dangerouslySetInnerHTML`** in the SPA.
-- **No unhandled promise rejections obvious from reading** — all `await` sites are inside try/catch or behind result-object helpers, and the gRPC worker promise is intentionally fire-and-forget with internal error catching (`server/index.ts:130-145`).
+- **No SQL injection.** All DB access goes through Drizzle's parameterised query builder (`server/storage.ts:26-30`). The single raw `sqlite.exec` (`server/storage.ts:9-15`) is a static `CREATE TABLE IF NOT EXISTS` with no interpolation.
+- **No `eval` and no `new Function(...)`.** Verified by `grep -rn "eval(\|new Function(" server/ client/src/ shared/` — zero hits.
+- **No leaked secrets.** `SVS_API_KEY` and `SVS_GRPC_X_TOKEN` are read in `server/svs.ts:58` and `server/grpcStream.ts:546` and never returned to a client, never logged, and never serialized into snapshots. `getGrpcStatus()` exposes only `hasToken: boolean` (a presence flag), not the value. There are zero `VITE_`-prefixed env vars in `client/src/`.
+- **No `any`-leak from `grpcStream.ts` to the rest of the app.** All `any` access is fenced into the parser helpers (`extractAccountKeys`, `extractMints`, `processTransactionUpdate`); the public exports `GrpcStatus` and `GrpcCandidate` are fully typed (`server/grpcStream.ts:11-58`).
+- **gRPC parse errors do not kill the worker.** The `try/catch` inside the `data` handler (`server/grpcStream.ts:489-503`) increments a counter and logs; `runStreamLoop` (`server/grpcStream.ts:521-541`) reconnects with exponential backoff capped at 30s.
+- **DexScreener fetches are deadline-bounded twice.** `AbortController` timeout *and* a `Promise.race` hard deadline (`server/routes.ts:139-178`) defend against event-loop starvation that could delay the abort timer.
+- **SSE handler cleans up on client disconnect.** `req.on("close", () => { closed = true; clearInterval(interval); })` (`server/routes.ts:935-938`) prevents the interval from leaking after a hangup. (Backpressure and heartbeat are still missing — see H5.)
+- **Snapshot fallback chain is layered correctly.** Memory cache → `lastGoodSnapshot` → SQLite-persisted last snapshot → empty well-formed snapshot (`server/routes.ts:775-851`). Each layer is reached only when the previous fails.
+- **No hardcoded credentials or production URLs that should be env-driven.** The only hardcoded URL is `https://api.dexscreener.com` (`server/routes.ts:74`), which is the intended public endpoint and has no auth. SVS endpoints all flow through `process.env.SVS_*`.
+- **`zod` schemas mirror the runtime shapes.** `shared/schema.ts:33-122` validates `RadarSnapshot`, `TokenSignal`, `MetaSignal`, and `GrpcSummary` end-to-end and is shared between server and client.
 
 ---
 
