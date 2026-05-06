@@ -74,7 +74,8 @@ Meme Velocity Radar is a read-only observation layer. It pulls from public DEX d
 | SVS RPC health probe | Working |
 | SVS gRPC live worker (launchpads + CPMM) | Working with safe defaults |
 | Raydium AMM v4 stream | Partial — opt-in only, can OOM small hosts |
-| Pump.fun program watcher | Partial — wired, watcher disabled by default (no program ID baked in) |
+| Pump.fun program watcher | Working — canonical program ID baked in as default |
+| Protocol decoders (Pump.fun create/graduate, PumpSwap pool, Raydium LaunchLab/CPMM) | Working — emits typed `launch.created` / `pool.created` / `launch.graduated` events with creator wallet |
 | `grpc-only` early-signal candidates | Working, conservative score |
 | CSV export | Working |
 | SSE live stream | Working |
@@ -82,7 +83,6 @@ Meme Velocity Radar is a read-only observation layer. It pulls from public DEX d
 | Auth cooldown after SVS 401/403 | Working |
 | Header badges | Working |
 | Mobile layout | Working |
-| Protocol-specific decoders (per-program create detection) | Not yet built |
 | Risk scoring from on-chain authority/holder data | Not yet built |
 | Social virality sources (X, Telegram) | Not yet built |
 | Backtesting / historical DB | Not yet built |

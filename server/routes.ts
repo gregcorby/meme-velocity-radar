@@ -443,6 +443,13 @@ function buildGrpcOnlyToken(
   );
   const opportunityFlags = ["grpc live tx", `grpc source: ${candidate.source}`];
   if (candidate.txCount > 1) opportunityFlags.push(`${candidate.txCount} grpc txs`);
+  if (candidate.launchEvent) {
+    opportunityFlags.push(`${candidate.launchEvent.protocol}:${candidate.launchEvent.instruction}`);
+    opportunityFlags.push(`event ${candidate.launchEvent.type}`);
+  }
+  if (candidate.creatorWallet) {
+    opportunityFlags.push(`creator ${candidate.creatorWallet.slice(0, 4)}…${candidate.creatorWallet.slice(-4)}`);
+  }
   const riskFlags = ["pre-dex or no pair yet", "grpc-only early signal"];
   if (!meta) riskFlags.push("no svs metadata");
   if (!price) riskFlags.push("no svs price");
@@ -513,6 +520,16 @@ function buildGrpcOnlyToken(
       risk: Math.round(risk),
       final: Math.round(final),
     },
+    creatorWallet: candidate.creatorWallet,
+    launchEvent: candidate.launchEvent
+      ? {
+          type: candidate.launchEvent.type,
+          protocol: candidate.launchEvent.protocol,
+          instruction: candidate.launchEvent.instruction,
+          signature: candidate.launchEvent.signature,
+          slot: candidate.launchEvent.slot,
+        }
+      : null,
   };
 }
 
@@ -666,6 +683,20 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
             }
             if (!token.opportunityFlags.includes("grpc live tx")) {
               token.opportunityFlags.push("grpc live tx");
+            }
+            if (grpcCandidate.creatorWallet && !token.creatorWallet) {
+              token.creatorWallet = grpcCandidate.creatorWallet;
+            }
+            if (grpcCandidate.launchEvent && !token.launchEvent) {
+              token.launchEvent = {
+                type: grpcCandidate.launchEvent.type,
+                protocol: grpcCandidate.launchEvent.protocol,
+                instruction: grpcCandidate.launchEvent.instruction,
+                signature: grpcCandidate.launchEvent.signature,
+                slot: grpcCandidate.launchEvent.slot,
+              };
+              const evtTag = `event:${grpcCandidate.launchEvent.type}`;
+              if (!token.opportunityFlags.includes(evtTag)) token.opportunityFlags.push(evtTag);
             }
           }
         }

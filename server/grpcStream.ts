@@ -7,6 +7,7 @@
 // well-typed candidate object for the rest of the app.
 
 import bs58 from "bs58";
+import { decodeLaunchEvent, type LaunchEvent } from "./decoders";
 
 type GrpcStatusKind =
   | "disabled"
@@ -26,6 +27,9 @@ export type GrpcDiagnostics = {
   lastCandidateAt: string | null;
   lastCandidateAgeSec: number | null;
   ignoredReasonCounts: Record<string, number>;
+  // Per-protocol decoded launch / pool / graduation events (P1.1).
+  decodedEventCounts: Record<string, number>;
+  lastDecodedEvent: { type: string; protocol: string; instruction: string; mint: string | null; at: string } | null;
 };
 
 export type GrpcStatus = {
@@ -53,8 +57,14 @@ export type GrpcCandidate = {
   source: string; // primary watched program name
   observedPrograms: string[];
   sourceTags: string[];
-  eventType: "grpc-transaction";
+  eventType: "grpc-transaction" | "launch.created" | "pool.created" | "launch.graduated";
   txCount: number;
+  // Populated by per-protocol decoders (P1.1). When set, the candidate was
+  // surfaced from a decoded create / pool-creation / graduation instruction
+  // rather than the generic token-balance fallback.
+  creatorWallet: string | null;
+  decimals: number | null;
+  launchEvent: LaunchEvent | null;
 };
 
 const STABLE_BLOCKLIST = new Set<string>([
@@ -108,7 +118,10 @@ function loadWatchPrograms(): WatchProgram[] {
     "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",
     true,
   );
-  pushIf("pumpfun", "WATCH_PUMPFUN_PROGRAM", undefined, true);
+  // Canonical Pump.fun program ID is well-known and stable. We bake it as
+  // the default so the watcher works out of the box; operators can still
+  // override via WATCH_PUMPFUN_PROGRAM.
+  pushIf("pumpfun", "WATCH_PUMPFUN_PROGRAM", "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", true);
 
   // DEX pools — gated by ENABLE_GRPC_DEX_POOLS. CPMM/CLMM default to enabled
   // when the umbrella toggle is on, AMM v4 stays opt-in even within that.
@@ -176,9 +189,14 @@ class CandidateStore {
     slot: number;
     sourceProgramId: string;
     observedPrograms: string[];
+    launchEvent?: LaunchEvent | null;
+    creatorWallet?: string | null;
+    decimals?: number | null;
   }) {
     const now = new Date().toISOString();
     const sourceName = WATCH_BY_ID.get(record.sourceProgramId) ?? "unknown-program";
+    const launchEvent = record.launchEvent ?? null;
+    const eventType: GrpcCandidate["eventType"] = launchEvent ? launchEvent.type : "grpc-transaction";
     const existing = this.map.get(record.mint);
     if (existing) {
       existing.lastSeenAt = now;
@@ -190,10 +208,23 @@ class CandidateStore {
           existing.observedPrograms.push(program);
         }
       }
+      // Decoder-provided fields are upgrades only — never overwrite a known
+      // launch.created with a later generic tx.
+      if (launchEvent && existing.eventType === "grpc-transaction") {
+        existing.eventType = launchEvent.type;
+        existing.launchEvent = launchEvent;
+      }
+      if (record.creatorWallet && !existing.creatorWallet) existing.creatorWallet = record.creatorWallet;
+      if (record.decimals != null && existing.decimals == null) existing.decimals = record.decimals;
+      const decoderTags = launchEvent ? [`${launchEvent.protocol}:${launchEvent.instruction}`, `event:${launchEvent.type}`] : [];
+      for (const tag of decoderTags) {
+        if (!existing.sourceTags.includes(tag)) existing.sourceTags.push(tag);
+      }
       this.map.delete(record.mint);
       this.map.set(record.mint, existing);
       return existing;
     }
+    const decoderTags = launchEvent ? [`${launchEvent.protocol}:${launchEvent.instruction}`, `event:${launchEvent.type}`] : [];
     const created: GrpcCandidate = {
       mint: record.mint,
       firstSeenAt: now,
@@ -202,9 +233,12 @@ class CandidateStore {
       slot: record.slot,
       source: sourceName,
       observedPrograms: record.observedPrograms.slice(),
-      sourceTags: ["grpc-live", "grpc-transaction", `grpc:${sourceName}`],
-      eventType: "grpc-transaction",
+      sourceTags: ["grpc-live", "grpc-transaction", `grpc:${sourceName}`, ...decoderTags],
+      eventType,
       txCount: 1,
+      creatorWallet: record.creatorWallet ?? null,
+      decimals: record.decimals ?? null,
+      launchEvent,
     };
     this.map.set(record.mint, created);
     this.evict();
@@ -259,6 +293,9 @@ let ignoredBaseMintCount = 0;
 let parseErrorCount = 0;
 let lastCandidateAt: number | null = null;
 const ignoredReasonCounts: Record<string, number> = {};
+const decodedEventCounts: Record<string, number> = {};
+let lastDecodedEvent: GrpcDiagnostics["lastDecodedEvent"] = null;
+const PROGRAM_IDS_BY_NAME = new Map(WATCH_PROGRAMS.map((p) => [p.name, p.programId]));
 
 function bumpReason(reason: string) {
   ignoredReasonCounts[reason] = (ignoredReasonCounts[reason] ?? 0) + 1;
@@ -415,13 +452,47 @@ function processTransactionUpdate(update: any) {
     return;
   }
   eventsWithCandidateMints++;
-  for (const mint of mints) {
+  // Run per-protocol decoders. When a decoder identifies a known
+  // create/pool/graduation instruction we attach a typed LaunchEvent to
+  // the candidate; otherwise we fall through to the generic path.
+  let decoded: LaunchEvent | null = null;
+  try {
+    decoded = decodeLaunchEvent(watched.observedPrograms, PROGRAM_IDS_BY_NAME, {
+      info,
+      accountKeys,
+      signature,
+      slot,
+    });
+  } catch {
+    // Decoder errors are isolated in decoders.ts; this catch is belt-and-suspenders.
+  }
+  if (decoded) {
+    const key = `${decoded.protocol}:${decoded.instruction}`;
+    decodedEventCounts[key] = (decodedEventCounts[key] ?? 0) + 1;
+    lastDecodedEvent = {
+      type: decoded.type,
+      protocol: decoded.protocol,
+      instruction: decoded.instruction,
+      mint: decoded.mint,
+      at: new Date().toISOString(),
+    };
+  }
+  // Prefer the decoder's mint when present; otherwise emit a candidate per
+  // mint extracted from token balances.
+  const decoderMint = decoded?.mint;
+  const mintsToEmit = decoderMint && !mints.includes(decoderMint) ? [decoderMint, ...mints] : mints;
+  for (const mint of mintsToEmit) {
     candidates.upsert({
       mint,
       signature,
       slot,
       sourceProgramId: watched.sourceProgramId,
       observedPrograms: watched.observedPrograms,
+      // Only attach the decoded event to the matching mint (when known)
+      // or to every emitted mint when the decoder couldn't pin one down.
+      launchEvent: !decoded ? null : decoderMint ? (mint === decoderMint ? decoded : null) : decoded,
+      creatorWallet: decoded?.creator ?? null,
+      decimals: decoded?.decimals ?? null,
     });
   }
   lastCandidateAt = Date.now();
@@ -592,6 +663,8 @@ export function getGrpcStatus(): GrpcStatus {
       lastCandidateAt: lastCandIso,
       lastCandidateAgeSec: lastCandAge,
       ignoredReasonCounts: { ...ignoredReasonCounts },
+      decodedEventCounts: { ...decodedEventCounts },
+      lastDecodedEvent: lastDecodedEvent ? { ...lastDecodedEvent } : null,
     },
   };
 }

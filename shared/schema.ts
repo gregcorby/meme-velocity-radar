@@ -71,6 +71,20 @@ export const tokenSignalSchema = z.object({
   riskFlags: z.array(z.string()),
   opportunityFlags: z.array(z.string()),
   scores: scoreBreakdownSchema,
+  // Per-protocol decoded event metadata (P1.1). Optional because most
+  // tokens come from the DexScreener path or generic gRPC token-balance
+  // extraction with no instruction-level decode.
+  creatorWallet: z.string().nullable().optional(),
+  launchEvent: z
+    .object({
+      type: z.enum(["launch.created", "pool.created", "launch.graduated"]),
+      protocol: z.string(),
+      instruction: z.string(),
+      signature: z.string(),
+      slot: z.number(),
+    })
+    .nullable()
+    .optional(),
 });
 
 export const metaSignalSchema = z.object({
