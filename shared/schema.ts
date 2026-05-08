@@ -128,6 +128,11 @@ export const radarSnapshotSchema = z.object({
   metas: z.array(metaSignalSchema),
   tokens: z.array(tokenSignalSchema),
   grpc: grpcSummarySchema.optional(),
+  // App-wide health gate. "broken" means at least one required upstream
+  // (DexScreener, SVS REST, gRPC) is not delivering. The client renders a
+  // hard error screen — we never serve a partial / inferior radar.
+  status: z.enum(["ok", "broken"]),
+  brokenSources: z.array(z.string()),
 });
 
 export type TokenSignal = z.infer<typeof tokenSignalSchema>;

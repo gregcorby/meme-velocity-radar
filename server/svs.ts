@@ -5,7 +5,16 @@
 const DEFAULT_API_BASE_URL = "https://free.api.solanavibestation.com";
 const SVS_TIMEOUT_MS = 8_000;
 const SVS_PROBE_TIMEOUT_MS = 3_000;
-const BATCH_SIZE = 36;
+// Tuned for SVS Ultra (250 r/s). Each mint in a POST body counts as one
+// request against the budget. 50% utilisation leaves headroom for
+// /api/svs/health probes, per-mint detail endpoints, and provider fuzz.
+const BATCH_SIZE = 50;
+const SVS_RATE_BUDGET_PER_SEC = 120;
+const SVS_RATE_WINDOW_MS = 1_000;
+const SVS_RATE_SAFETY_MS = 75;
+const SVS_DEFAULT_RETRY_AFTER_MS = 2_500;
+const SVS_MAX_RETRY_AFTER_MS = 5_000;
+const SVS_MAX_429_RETRIES = 2;
 // Cooldown after the SVS API returns an auth-rejected status (401/403). While
 // the cooldown is active we short-circuit /metadata, /price, and /mint_info
 // calls so the radar stops hammering the API with an invalid key. Probes
@@ -54,10 +63,22 @@ export function getSvsConfig(): SvsConfig {
   };
 }
 
-function authHeaders() {
+// SVS REST API authenticates via `?api_key=` query param (same scheme as their
+// RPC endpoint), not an Authorization header. We return JSON content-type
+// headers and append the key to the URL via `apiUrl()`.
+function apiHeaders() {
   const key = process.env.SVS_API_KEY?.trim();
   if (!key) return null;
-  return { Authorization: `Bearer ${key}`, "Content-Type": "application/json" } as Record<string, string>;
+  return { "Content-Type": "application/json" } as Record<string, string>;
+}
+
+function apiUrl(path: string): string | null {
+  const key = process.env.SVS_API_KEY?.trim();
+  if (!key) return null;
+  const config = getSvsConfig();
+  const base = config.apiBaseUrl.replace(/\/+$/, "");
+  const cleanPath = path.startsWith("/") ? path : `/${path}`;
+  return `${base}${cleanPath}?api_key=${encodeURIComponent(key)}`;
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = SVS_TIMEOUT_MS) {
@@ -70,11 +91,77 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = SVS_
   }
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function chunk<T>(items: T[], size: number): T[][] {
   if (size <= 0) return [items];
   const out: T[][] = [];
   for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
   return out;
+}
+
+type RateReservation = { at: number; cost: number };
+
+const rateReservations: RateReservation[] = [];
+let rateQueue = Promise.resolve();
+let svsRateLimitedUntil = 0;
+
+function pruneRateReservations(now: number) {
+  while (rateReservations.length && now - rateReservations[0].at >= SVS_RATE_WINDOW_MS) {
+    rateReservations.shift();
+  }
+}
+
+async function waitForSvsCapacity(cost: number) {
+  const normalizedCost = Math.min(SVS_RATE_BUDGET_PER_SEC, Math.max(1, Math.ceil(cost)));
+  const reserve = async () => {
+    for (;;) {
+      const now = Date.now();
+      const rateCooldownMs = svsRateLimitedUntil - now;
+      if (rateCooldownMs > 0) {
+        await sleep(rateCooldownMs + SVS_RATE_SAFETY_MS);
+        continue;
+      }
+
+      pruneRateReservations(now);
+      const used = rateReservations.reduce((sum, item) => sum + item.cost, 0);
+      if (used + normalizedCost <= SVS_RATE_BUDGET_PER_SEC) {
+        rateReservations.push({ at: now, cost: normalizedCost });
+        return;
+      }
+
+      const oldest = rateReservations[0];
+      const waitMs = oldest ? oldest.at + SVS_RATE_WINDOW_MS - now + SVS_RATE_SAFETY_MS : SVS_RATE_SAFETY_MS;
+      await sleep(Math.max(SVS_RATE_SAFETY_MS, waitMs));
+    }
+  };
+
+  const next = rateQueue.then(reserve, reserve);
+  rateQueue = next.catch(() => undefined);
+  await next;
+}
+
+function retryAfterMs(response: Response) {
+  const header = response.headers.get("retry-after");
+  if (!header) return SVS_DEFAULT_RETRY_AFTER_MS;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return Math.max(0, Math.min(seconds * 1000, SVS_MAX_RETRY_AFTER_MS));
+  const dateMs = Date.parse(header);
+  if (Number.isFinite(dateMs)) return Math.max(0, Math.min(dateMs - Date.now(), SVS_MAX_RETRY_AFTER_MS));
+  return SVS_DEFAULT_RETRY_AFTER_MS;
+}
+
+function noteSvsRateLimited(response: Response) {
+  const waitMs = retryAfterMs(response);
+  svsRateLimitedUntil = Math.max(svsRateLimitedUntil, Date.now() + waitMs);
+  return waitMs;
+}
+
+function rateLimitedError(response: Response) {
+  const waitSec = Math.max(1, Math.ceil(Math.max(0, svsRateLimitedUntil - Date.now()) / 1000));
+  return `${response.status} ${response.statusText || "Too Many Requests"} — backing off SVS API for ~${waitSec}s`;
 }
 
 export type SvsMetadataRecord = {
@@ -145,8 +232,9 @@ async function postBatch<T extends { mint?: string }>(
   path: string,
   mints: string[],
 ): Promise<{ ok: true; map: Map<string, T> } | { ok: false; error: string }> {
-  const headers = authHeaders();
-  if (!headers) return { ok: false, error: "SVS_API_KEY not configured" };
+  const headers = apiHeaders();
+  const url = apiUrl(path);
+  if (!headers || !url) return { ok: false, error: "SVS_API_KEY not configured" };
   const cooldown = inAuthCooldown();
   if (cooldown.cooling) {
     return {
@@ -154,15 +242,27 @@ async function postBatch<T extends { mint?: string }>(
       error: `auth rejected — skipping for ${Math.round(cooldown.remainingMs / 1000)}s (status ${lastAuthRejectStatus ?? "?"})`,
     };
   }
-  const config = getSvsConfig();
   const merged = new Map<string, T>();
+  const doRequest = async (group: string[]) => {
+    await waitForSvsCapacity(group.length);
+    return fetchWithTimeout(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ mints: group }),
+    });
+  };
   try {
     for (const group of chunk(mints, BATCH_SIZE)) {
-      const response = await fetchWithTimeout(`${config.apiBaseUrl}${path}`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ mints: group }),
-      });
+      let response = await doRequest(group);
+      for (let attempt = 0; response.status === 429 && attempt < SVS_MAX_429_RETRIES; attempt++) {
+        const waitMs = noteSvsRateLimited(response);
+        await sleep(waitMs);
+        response = await doRequest(group);
+      }
+      if (response.status === 429) {
+        noteSvsRateLimited(response);
+        return { ok: false, error: rateLimitedError(response) };
+      }
       if (response.status === 401 || response.status === 403) {
         noteAuthRejected(response.status);
         return {
@@ -183,14 +283,74 @@ async function postBatch<T extends { mint?: string }>(
   }
 }
 
+// Per-mint TTL caches. Free SVS tier is 10 r/s; without caches we burn the
+// budget re-fetching the same mints every snapshot cycle (every 20s). Remove
+// or expand TTLs when the SVS plan is upgraded.
+type CacheEntry<T> = { data: T; expires: number };
+
+class MintCache<T> {
+  private map = new Map<string, CacheEntry<T>>();
+  constructor(private ttlMs: number) {}
+
+  get(mint: string): T | undefined {
+    const entry = this.map.get(mint);
+    if (!entry) return undefined;
+    if (entry.expires < Date.now()) {
+      this.map.delete(mint);
+      return undefined;
+    }
+    return entry.data;
+  }
+
+  set(mint: string, data: T): void {
+    this.map.set(mint, { data, expires: Date.now() + this.ttlMs });
+  }
+}
+
+const METADATA_TTL_MS = 5 * 60_000; // metadata is essentially static
+const PRICE_TTL_MS = 30_000;        // tighter — price changes fast, but 30s keeps us under 10 r/s
+const MINT_INFO_TTL_MS = 5 * 60_000; // mint info is static once seen
+
+const metadataCache = new MintCache<SvsMetadataRecord>(METADATA_TTL_MS);
+const priceCache = new MintCache<SvsPriceRecord>(PRICE_TTL_MS);
+const mintInfoCache = new MintCache<SvsMintInfoRecord>(MINT_INFO_TTL_MS);
+
 export async function fetchSvsMetadata(mints: string[]) {
   if (!mints.length) return { ok: true as const, map: new Map<string, SvsMetadataRecord>() };
-  return postBatch<SvsMetadataRecord>("/metadata", mints);
+  const result = new Map<string, SvsMetadataRecord>();
+  const misses: string[] = [];
+  for (const mint of mints) {
+    const cached = metadataCache.get(mint);
+    if (cached) result.set(mint, cached);
+    else misses.push(mint);
+  }
+  if (!misses.length) return { ok: true as const, map: result };
+  const fresh = await postBatch<SvsMetadataRecord>("/metadata", misses);
+  if (!fresh.ok) return fresh;
+  fresh.map.forEach((value, key) => {
+    result.set(key, value);
+    metadataCache.set(key, value);
+  });
+  return { ok: true as const, map: result };
 }
 
 export async function fetchSvsPrices(mints: string[]) {
   if (!mints.length) return { ok: true as const, map: new Map<string, SvsPriceRecord>() };
-  return postBatch<SvsPriceRecord>("/price", mints);
+  const result = new Map<string, SvsPriceRecord>();
+  const misses: string[] = [];
+  for (const mint of mints) {
+    const cached = priceCache.get(mint);
+    if (cached) result.set(mint, cached);
+    else misses.push(mint);
+  }
+  if (!misses.length) return { ok: true as const, map: result };
+  const fresh = await postBatch<SvsPriceRecord>("/price", misses);
+  if (!fresh.ok) return fresh;
+  fresh.map.forEach((value, key) => {
+    result.set(key, value);
+    priceCache.set(key, value);
+  });
+  return { ok: true as const, map: result };
 }
 
 export async function fetchSvsMintInfo(
@@ -198,8 +358,19 @@ export async function fetchSvsMintInfo(
   concurrency = 3,
 ): Promise<{ ok: true; map: Map<string, SvsMintInfoRecord> } | { ok: false; error: string }> {
   if (!mints.length) return { ok: true, map: new Map() };
-  const headers = authHeaders();
-  if (!headers) return { ok: false, error: "SVS_API_KEY not configured" };
+  // Serve cache hits, then fetch only the misses.
+  const map = new Map<string, SvsMintInfoRecord>();
+  const misses: string[] = [];
+  for (const mint of mints) {
+    const cached = mintInfoCache.get(mint);
+    if (cached) map.set(mint, cached);
+    else misses.push(mint);
+  }
+  if (!misses.length) return { ok: true, map };
+
+  const headers = apiHeaders();
+  const url = apiUrl("/mint_info");
+  if (!headers || !url) return { ok: false, error: "SVS_API_KEY not configured" };
   const cooldown = inAuthCooldown();
   if (cooldown.cooling) {
     return {
@@ -207,28 +378,48 @@ export async function fetchSvsMintInfo(
       error: `auth rejected — skipping for ${Math.round(cooldown.remainingMs / 1000)}s`,
     };
   }
-  const config = getSvsConfig();
-  const map = new Map<string, SvsMintInfoRecord>();
   let cursor = 0;
   let firstError: string | null = null;
   let authRejected = false;
   const reqHeaders = headers;
+  const reqUrl = url;
   async function worker() {
-    while (cursor < mints.length) {
+    while (cursor < misses.length) {
       if (authRejected) return;
       const idx = cursor++;
-      const mint = mints[idx];
+      const mint = misses[idx];
       try {
-        const response = await fetchWithTimeout(`${config.apiBaseUrl}/mint_info`, {
-          method: "POST",
-          headers: reqHeaders,
-          body: JSON.stringify({ mint }),
-        });
+        const doRequest = async () => {
+          await waitForSvsCapacity(1);
+          return fetchWithTimeout(reqUrl, {
+            method: "POST",
+            headers: reqHeaders,
+            body: JSON.stringify({ mint }),
+          });
+        };
+        let response = await doRequest();
+        for (let attempt = 0; response.status === 429 && attempt < SVS_MAX_429_RETRIES; attempt++) {
+          const waitMs = noteSvsRateLimited(response);
+          await sleep(waitMs);
+          response = await doRequest();
+        }
+        if (response.status === 429) {
+          noteSvsRateLimited(response);
+          if (!firstError) firstError = rateLimitedError(response);
+          continue;
+        }
         if (response.status === 401 || response.status === 403) {
           noteAuthRejected(response.status);
           authRejected = true;
           if (!firstError) firstError = `auth rejected (${response.status})`;
           return;
+        }
+        // /mint_info only serves pump.fun / bonk.fun launches <72h old.
+        // 404 = "not eligible", which is normal for most mints — skip silently
+        // and cache an empty record so we don't re-ask for 5 min.
+        if (response.status === 404) {
+          mintInfoCache.set(mint, { mint });
+          continue;
         }
         if (!response.ok) {
           if (!firstError) firstError = `${response.status} ${response.statusText}`;
@@ -236,17 +427,99 @@ export async function fetchSvsMintInfo(
         }
         const json = (await response.json()) as SvsMintInfoRecord;
         if (json && typeof json === "object") {
-          map.set(mint, { ...json, mint });
+          const record = { ...json, mint };
+          map.set(mint, record);
+          mintInfoCache.set(mint, record);
         }
       } catch (error) {
         if (!firstError) firstError = error instanceof Error ? error.message : "svs mint_info failed";
       }
     }
   }
-  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), mints.length) }, worker);
+  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), misses.length) }, worker);
   await Promise.all(workers);
   if (!map.size && firstError) return { ok: false, error: firstError };
   return { ok: true, map };
+}
+
+// Solana JSON-RPC helper. Separate from the SVS-API rate limiter because
+// Solana RPC has its own budget and most providers tolerate higher RPS.
+const SOLANA_RPC_TIMEOUT_MS = 6000;
+
+class RpcNotConfiguredError extends Error {
+  constructor() {
+    super("SVS_RPC_HTTP_URL not set");
+    this.name = "RpcNotConfiguredError";
+  }
+}
+
+async function callSolanaRpc<T>(method: string, params: unknown[]): Promise<T> {
+  const url = process.env.SVS_RPC_HTTP_URL?.trim();
+  if (!url) throw new RpcNotConfiguredError();
+  const response = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    },
+    SOLANA_RPC_TIMEOUT_MS,
+  );
+  if (!response.ok) {
+    throw new Error(`Solana RPC ${method} ${response.status}`);
+  }
+  const json = (await response.json()) as { result?: T; error?: { message?: string; code?: number } };
+  if (json.error) throw new Error(json.error.message ?? `Solana RPC ${method} error`);
+  if (json.result === undefined) throw new Error(`Solana RPC ${method} empty result`);
+  return json.result;
+}
+
+export function isRpcNotConfigured(err: unknown): boolean {
+  return err instanceof RpcNotConfiguredError;
+}
+
+export type SolanaTokenAmount = {
+  amount: string;
+  decimals: number;
+  uiAmount: number | null;
+  uiAmountString?: string;
+};
+
+export type LargestAccountEntry = {
+  address: string;
+  amount: string;
+  decimals: number;
+  uiAmount: number | null;
+  uiAmountString?: string;
+};
+
+export async function fetchTokenLargestAccounts(mint: string): Promise<LargestAccountEntry[]> {
+  const result = await callSolanaRpc<{ value: LargestAccountEntry[] }>("getTokenLargestAccounts", [
+    mint,
+    { commitment: "confirmed" },
+  ]);
+  return result.value ?? [];
+}
+
+export async function fetchTokenSupply(mint: string): Promise<SolanaTokenAmount> {
+  const result = await callSolanaRpc<{ value: SolanaTokenAmount }>("getTokenSupply", [mint]);
+  return result.value;
+}
+
+export type SignatureEntry = {
+  signature: string;
+  slot: number;
+  blockTime: number | null;
+  err: unknown;
+  confirmationStatus?: string;
+};
+
+export async function fetchSignaturesForAddress(mint: string, limit = 25): Promise<SignatureEntry[]> {
+  const result = await callSolanaRpc<SignatureEntry[]>("getSignaturesForAddress", [
+    mint,
+    { limit: Math.min(Math.max(1, limit), 100) },
+  ]);
+  return result ?? [];
 }
 
 export type RpcProbeResult = {
@@ -298,18 +571,37 @@ export type SvsApiProbeResult = {
   detail: string;
 };
 
+// Cache the API probe to avoid hammering /price every time /api/svs/health
+// is hit. Without this, dashboards/scripts polling health spend our 10 r/s
+// budget probing instead of enriching the radar.
+let lastProbeResult: SvsApiProbeResult | null = null;
+let lastProbeAt = 0;
+const PROBE_CACHE_MS = 30_000;
+
 export async function probeSvsApiReachability(): Promise<SvsApiProbeResult> {
+  if (lastProbeResult && Date.now() - lastProbeAt < PROBE_CACHE_MS) {
+    return lastProbeResult;
+  }
+  const result = await runProbe();
+  lastProbeResult = result;
+  lastProbeAt = Date.now();
+  return result;
+}
+
+async function runProbe(): Promise<SvsApiProbeResult> {
   const config = getSvsConfig();
   if (!config.hasApiKey) {
     return { configured: false, status: "missing", detail: "SVS_API_KEY not set" };
   }
   // Use SOL native mint as a known-safe probe target.
   const probeMint = "So11111111111111111111111111111111111111112";
-  const headers = authHeaders();
-  if (!headers) return { configured: false, status: "missing", detail: "SVS_API_KEY not set" };
+  const headers = apiHeaders();
+  const url = apiUrl("/price");
+  if (!headers || !url) return { configured: false, status: "missing", detail: "SVS_API_KEY not set" };
   try {
+    await waitForSvsCapacity(1);
     const response = await fetchWithTimeout(
-      `${config.apiBaseUrl}/price`,
+      url,
       {
         method: "POST",
         headers,
@@ -317,6 +609,10 @@ export async function probeSvsApiReachability(): Promise<SvsApiProbeResult> {
       },
       SVS_PROBE_TIMEOUT_MS,
     );
+    if (response.status === 429) {
+      noteSvsRateLimited(response);
+      return { configured: true, status: "degraded", detail: rateLimitedError(response) };
+    }
     if (response.status === 401 || response.status === 403) {
       noteAuthRejected(response.status);
       return {

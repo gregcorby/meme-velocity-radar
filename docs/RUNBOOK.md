@@ -77,14 +77,14 @@ SVS_API_KEY=                                              # bearer token for SVS
 ### SVS RPC (HTTP + WebSocket)
 
 ```bash
-SVS_RPC_HTTP_URL=https://basic.rpc.solanavibestation.com/?api_key=YOUR_KEY
-SVS_RPC_WS_URL=wss://basic.rpc.solanavibestation.com/?api_key=YOUR_KEY
+SVS_RPC_HTTP_URL=https://ultra.rpc.solanavibestation.com/?api_key=YOUR_KEY
+SVS_RPC_WS_URL=wss://ultra.rpc.solanavibestation.com/?api_key=YOUR_KEY
 ```
 
 ### SVS gRPC (Yellowstone live transactions)
 
 ```bash
-SVS_GRPC_ENDPOINT=https://basic.grpc.solanavibestation.com
+SVS_GRPC_ENDPOINT=https://ultra.grpc.solanavibestation.com
 SVS_GRPC_X_TOKEN=                                         # blank if your plan is IP-whitelist
 ```
 

@@ -13,6 +13,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sh
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Progress } from "@/components/ui/progress";
 import NotFound from "@/pages/not-found";
+import RawFeedPage from "@/pages/raw-feed";
 import type { RadarSnapshot, TokenSignal } from "@shared/schema";
 import {
   Activity,
@@ -60,6 +61,21 @@ type SvsHealthReport = {
   overall: SvsHealthStatus;
   checkedAt: string;
 };
+
+type HoldersResponse = {
+  supply: { uiAmount: number; decimals: number; amount: string };
+  top: Array<{ address: string; uiAmount: number; pct: number }>;
+  top10Pct: number;
+  fetchedAt: string;
+};
+type TradeEntry = {
+  signature: string;
+  slot: number;
+  blockTime: number | null;
+  err: unknown;
+  confirmationStatus?: string;
+};
+type TradesResponse = { signatures: TradeEntry[]; fetchedAt: string };
 
 type GrpcWorkerStatus = "disabled" | "configured" | "connecting" | "connected" | "reconnecting" | "error";
 type GrpcStatusReport = {
@@ -217,24 +233,90 @@ function GrpcBadge({ status }: { status: GrpcStatusReport | undefined }) {
   );
 }
 
-function ScorePill({ label, value, danger = false }: { label: string; value: number; danger?: boolean }) {
+type Driver = { label: string; value: string };
+
+function ScorePill({
+  label,
+  value,
+  drivers,
+  danger = false,
+}: {
+  label: string;
+  value: number;
+  drivers: Driver[];
+  danger?: boolean;
+}) {
   return (
-    <div className="rounded-lg border border-border/70 bg-card/70 p-3" data-testid={`score-${label.toLowerCase()}`}>
-      <div className="mb-2 flex items-center justify-between gap-3">
-        <span className="text-xs text-muted-foreground">{label}</span>
-        <span className={`font-mono text-sm font-semibold ${danger ? riskTone(value) : scoreTone(value)}`}>{value}</span>
+    <div className="rounded-2xl border border-border bg-card p-4" data-testid={`score-${label.toLowerCase()}`}>
+      <div className="flex items-baseline justify-between">
+        <p className="text-[10px] font-medium uppercase tracking-[0.18em] text-muted-foreground">{label}</p>
+        <span className={`font-mono text-2xl font-semibold leading-none tracking-tight ${danger ? riskTone(value) : scoreTone(value)}`}>
+          {value}
+        </span>
       </div>
-      <Progress value={value} className="h-1.5" />
+      <div className="mt-3 divide-y divide-border/50">
+        {drivers.map((d) => (
+          <div key={d.label} className="flex items-center justify-between py-1.5 first:pt-0 last:pb-0">
+            <span className="text-[10px] uppercase tracking-wider text-muted-foreground">{d.label}</span>
+            <span className="font-mono text-xs text-foreground/85">{d.value}</span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
 
-function TokenAvatar({ token }: { token: TokenSignal }) {
+function fmtMult(value: number) {
+  if (!Number.isFinite(value)) return "—";
+  return `${value.toFixed(value >= 10 ? 0 : 1)}×`;
+}
+
+function countSocialLinks(token: TokenSignal) {
+  return token.links.filter((link) => /x\.com|twitter|t\.me|telegram|discord|tiktok|instagram/i.test(link.url)).length;
+}
+
+function velocityDrivers(token: TokenSignal): Driver[] {
+  return [
+    { label: "Vol accel", value: fmtMult(token.volumeAcceleration) },
+    { label: "Tx accel", value: fmtMult(token.txnAcceleration) },
+    { label: "Buy press 1h", value: fmtPct(token.buyPressureH1 * 100) },
+  ];
+}
+
+function viralityDrivers(token: TokenSignal): Driver[] {
+  return [
+    { label: "Boost", value: token.boostAmount ? `${token.boostAmount}u` : "0" },
+    { label: "Socials", value: String(countSocialLinks(token)) },
+    { label: "Desc len", value: String(token.description?.length ?? 0) },
+  ];
+}
+
+function upsideDrivers(token: TokenSignal): Driver[] {
+  return [
+    { label: "Mcap", value: fmtMoney(token.marketCap) },
+    { label: "Liq", value: fmtMoney(token.liquidityUsd) },
+    { label: "Age", value: fmtAge(token.pairAgeMinutes) },
+  ];
+}
+
+function riskDrivers(token: TokenSignal): Driver[] {
+  return [
+    { label: "Liq", value: fmtMoney(token.liquidityUsd) },
+    { label: "Age", value: fmtAge(token.pairAgeMinutes) },
+    { label: "Flags", value: String(token.riskFlags.length) },
+  ];
+}
+
+function TokenAvatar({ token, size = 14 }: { token: TokenSignal; size?: 12 | 14 | 16 | 20 }) {
   const [failed, setFailed] = useState(false);
   const initials = token.symbol.slice(0, 3).toUpperCase();
+  const dim = { 12: "h-12 w-12", 14: "h-14 w-14", 16: "h-16 w-16", 20: "h-20 w-20" }[size];
   if (!token.imageUrl || failed) {
     return (
-      <div className="grid h-12 w-12 shrink-0 place-items-center rounded-xl border border-border bg-muted font-mono text-xs font-semibold" data-testid={`avatar-fallback-${token.id}`}>
+      <div
+        className={`grid ${dim} shrink-0 place-items-center rounded-xl border border-border bg-muted font-mono text-xs font-semibold`}
+        data-testid={`avatar-fallback-${token.id}`}
+      >
         {initials}
       </div>
     );
@@ -243,7 +325,7 @@ function TokenAvatar({ token }: { token: TokenSignal }) {
     <img
       src={token.imageUrl}
       alt={`${token.name} token artwork`}
-      className="h-12 w-12 shrink-0 rounded-xl border border-border object-cover"
+      className={`${dim} shrink-0 rounded-xl border border-border object-cover`}
       crossOrigin="anonymous"
       onError={() => setFailed(true)}
       data-testid={`img-token-${token.id}`}
@@ -254,60 +336,81 @@ function TokenAvatar({ token }: { token: TokenSignal }) {
 function TokenCard({
   token,
   active,
+  index,
   onSelect,
 }: {
   token: TokenSignal;
   active: boolean;
+  index: number;
   onSelect: (token: TokenSignal) => void;
 }) {
+  const accel = token.volumeAcceleration ?? 0;
+  const accelHot = accel >= 1.5;
   return (
     <button
       type="button"
       onClick={() => onSelect(token)}
-      className={`group w-full rounded-xl border p-4 text-left transition hover:bg-accent/50 ${
-        active ? "border-primary bg-primary/7 shadow-sm" : "border-border bg-card"
+      className={`group relative w-full rounded-2xl border bg-card p-4 text-left transition hover:border-primary/60 ${
+        active ? "border-primary" : "border-border"
       }`}
       data-testid={`button-token-${token.id}`}
     >
-      <div className="flex items-start gap-3">
-        <TokenAvatar token={token} />
+      <div className="flex items-start gap-4">
+        <TokenAvatar token={token} size={14} />
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
-              <p className="truncate font-semibold leading-tight" data-testid={`text-token-name-${token.id}`}>
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-[10px] font-medium tracking-[0.2em] text-muted-foreground">
+                  {String(index + 1).padStart(2, "0")}
+                </span>
+                <p className="truncate font-mono text-xs uppercase tracking-wider text-muted-foreground">
+                  {token.symbol}
+                </p>
+              </div>
+              <p className="mt-1 truncate text-base font-semibold leading-tight tracking-tight" data-testid={`text-token-name-${token.id}`}>
                 {token.name}
               </p>
-              <p className="font-mono text-xs text-muted-foreground">{token.symbol}</p>
             </div>
-            <div className={`font-mono text-xl font-semibold leading-none ${scoreTone(token.scores.final)}`} data-testid={`text-final-score-${token.id}`}>
-              {token.scores.final}
+            <div className="text-right">
+              <p className={`font-mono text-3xl font-semibold leading-none tracking-tight ${scoreTone(token.scores.final)}`} data-testid={`text-final-score-${token.id}`}>
+                {token.scores.final}
+              </p>
+              <p className="mt-1 font-mono text-sm text-foreground/80">{fmtMoney(token.marketCap)}</p>
+              <p className="mt-0.5 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+                liq {fmtMoney(token.liquidityUsd)}
+              </p>
             </div>
           </div>
-          <div className="mt-3 flex flex-wrap gap-1.5">
-            {token.opportunityFlags.slice(0, 2).map((flag) => (
-              <Badge key={flag} variant="secondary" className="max-w-full truncate text-[11px]" data-testid={`badge-opportunity-${token.id}-${flag}`}>
+
+          <div className="mt-3 flex flex-wrap items-center gap-1.5">
+            <span
+              className={`rounded-full border px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider ${
+                accelHot
+                  ? "border-primary/60 bg-primary/10 text-primary"
+                  : "border-border bg-muted/60 text-muted-foreground"
+              }`}
+            >
+              vol {fmtMult(accel)}
+            </span>
+            {token.opportunityFlags.slice(0, 1).map((flag) => (
+              <span
+                key={flag}
+                className="rounded-full border border-border bg-muted/60 px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground"
+                data-testid={`badge-opportunity-${token.id}-${flag}`}
+              >
                 {flag}
-              </Badge>
+              </span>
             ))}
             {token.riskFlags.slice(0, 1).map((flag) => (
-              <Badge key={flag} variant="outline" className="border-amber-500/40 text-[11px] text-amber-700 dark:text-amber-200" data-testid={`badge-risk-${token.id}-${flag}`}>
+              <span
+                key={flag}
+                className="rounded-full border border-destructive/40 px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider text-destructive"
+                data-testid={`badge-risk-${token.id}-${flag}`}
+              >
                 {flag}
-              </Badge>
+              </span>
             ))}
-          </div>
-          <div className="mt-4 grid grid-cols-3 gap-2 text-xs">
-            <div>
-              <p className="text-muted-foreground">5m pace</p>
-              <p className="font-mono font-medium">{token.volumeAcceleration.toFixed(1)}x</p>
-            </div>
-            <div>
-              <p className="text-muted-foreground">H1 buy</p>
-              <p className="font-mono font-medium">{(token.buyPressureH1 * 100).toFixed(0)}%</p>
-            </div>
-            <div>
-              <p className="text-muted-foreground">Cap</p>
-              <p className="font-mono font-medium">{fmtMoney(token.marketCap)}</p>
-            </div>
           </div>
         </div>
       </div>
@@ -315,7 +418,121 @@ function TokenCard({
   );
 }
 
-function DetailPanel({ token, onOpenSheet }: { token: TokenSignal | undefined; onOpenSheet: () => void }) {
+function shortAddress(addr: string) {
+  if (!addr) return "—";
+  return `${addr.slice(0, 4)}…${addr.slice(-4)}`;
+}
+
+function relTime(blockTime: number | null) {
+  if (!blockTime) return "—";
+  const sec = Math.max(0, Math.floor(Date.now() / 1000 - blockTime));
+  if (sec < 60) return `${sec}s ago`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
+  return `${Math.floor(sec / 86400)}d ago`;
+}
+
+function HoldersCard({ data, error, loading }: { data: HoldersResponse | undefined; error: unknown; loading: boolean }) {
+  const concentrated = (data?.top10Pct ?? 0) > 50;
+  return (
+    <div className="rounded-2xl border border-border bg-background p-5">
+      <div className="mb-3 flex items-center justify-between">
+        <p className="text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground">Top holders</p>
+        {data ? (
+          <span className={`font-mono text-[10px] uppercase tracking-wider ${concentrated ? "text-destructive" : "text-muted-foreground"}`}>
+            top10 {data.top10Pct.toFixed(1)}%
+          </span>
+        ) : null}
+      </div>
+      {loading && !data ? (
+        <div className="space-y-2">{Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="h-6 rounded" />)}</div>
+      ) : error ? (
+        <p className="font-body text-xs text-muted-foreground">Holder data unavailable.</p>
+      ) : !data?.top.length ? (
+        <p className="font-body text-xs text-muted-foreground">No holder data returned.</p>
+      ) : (
+        <div className="divide-y divide-border/50">
+          {data.top.slice(0, 10).map((h, i) => (
+            <div key={h.address} className="flex items-center gap-3 py-2 first:pt-0 last:pb-0" data-testid={`holder-${i}`}>
+              <span className="w-6 font-mono text-[10px] tracking-[0.18em] text-muted-foreground">{String(i + 1).padStart(2, "0")}</span>
+              <a
+                href={`https://solscan.io/account/${h.address}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-mono text-xs text-foreground/80 hover:text-primary"
+              >
+                {shortAddress(h.address)}
+              </a>
+              <div className="ml-auto flex items-center gap-2">
+                <div className="hidden h-1.5 w-20 overflow-hidden rounded-full bg-muted sm:block">
+                  <div className="h-full rounded-full bg-primary" style={{ width: `${Math.min(100, h.pct)}%` }} />
+                </div>
+                <span className="font-mono text-xs tabular-nums">{h.pct.toFixed(2)}%</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TradesCard({ data, error, loading }: { data: TradesResponse | undefined; error: unknown; loading: boolean }) {
+  return (
+    <div className="rounded-2xl border border-border bg-background p-5">
+      <div className="mb-3 flex items-center justify-between">
+        <p className="text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground">Recent activity</p>
+        <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">signatures</span>
+      </div>
+      {loading && !data ? (
+        <div className="space-y-2">{Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="h-6 rounded" />)}</div>
+      ) : error ? (
+        <p className="font-body text-xs text-muted-foreground">Trade data unavailable.</p>
+      ) : !data?.signatures.length ? (
+        <p className="font-body text-xs text-muted-foreground">No recent signatures.</p>
+      ) : (
+        <div className="divide-y divide-border/50">
+          {data.signatures.slice(0, 15).map((tx) => (
+            <a
+              key={tx.signature}
+              href={`https://solscan.io/tx/${tx.signature}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-3 py-2 hover:text-primary"
+              data-testid={`trade-${tx.signature.slice(0, 8)}`}
+            >
+              <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${tx.err ? "bg-destructive" : "bg-primary"}`} aria-hidden="true" />
+              <span className="font-mono text-xs text-foreground/80">{shortAddress(tx.signature)}</span>
+              <span className="ml-auto font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+                {relTime(tx.blockTime)}
+              </span>
+            </a>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DetailPanel({
+  token,
+  onOpenSheet,
+  holders,
+  holdersError,
+  holdersLoading,
+  trades,
+  tradesError,
+  tradesLoading,
+}: {
+  token: TokenSignal | undefined;
+  onOpenSheet: () => void;
+  holders: HoldersResponse | undefined;
+  holdersError: unknown;
+  holdersLoading: boolean;
+  trades: TradesResponse | undefined;
+  tradesError: unknown;
+  tradesLoading: boolean;
+}) {
   if (!token) {
     return (
       <Card className="h-full border-dashed" data-testid="empty-detail-panel">
@@ -330,141 +547,105 @@ function DetailPanel({ token, onOpenSheet }: { token: TokenSignal | undefined; o
     );
   }
 
-  const chartData = normalizeChart(token);
+  const chartUrl = token.pairAddress
+    ? `https://dexscreener.com/solana/${token.pairAddress}?embed=1&theme=dark&info=0`
+    : null;
 
   return (
-    <section className="flex h-full min-h-0 flex-col rounded-xl border border-border bg-card" data-testid={`detail-panel-${token.id}`}>
-      <div className="border-b border-border p-5">
+    <section className="flex h-full min-h-0 flex-col rounded-2xl border border-border bg-card" data-testid={`detail-panel-${token.id}`}>
+      <div className="border-b border-border p-6">
         <div className="flex items-start justify-between gap-4">
           <div className="flex min-w-0 items-start gap-4">
-            <TokenAvatar token={token} />
+            <TokenAvatar token={token} size={16} />
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
-                <h1 className="truncate text-xl font-semibold leading-tight" data-testid="text-selected-token">
-                  {token.name}
-                </h1>
-                <Badge variant="secondary" data-testid="badge-meme-type">
+                <span className="font-mono text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
+                  {token.symbol}
+                </span>
+                <span className="rounded-full border border-border px-2.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-muted-foreground" data-testid="badge-meme-type">
                   {token.memeType}
-                </Badge>
+                </span>
               </div>
-              <p className="mt-1 font-mono text-xs text-muted-foreground">{token.tokenAddress}</p>
+              <h1 className="mt-1 truncate text-2xl font-semibold leading-tight tracking-tight" data-testid="text-selected-token">
+                {token.name}
+              </h1>
+              <p className="mt-2 truncate font-mono text-[11px] text-muted-foreground">{token.tokenAddress}</p>
             </div>
           </div>
           <div className="text-right">
-            <p className="text-xs text-muted-foreground">Radar score</p>
-            <p className={`font-mono text-3xl font-semibold leading-none ${scoreTone(token.scores.final)}`} data-testid="text-selected-score">
+            <p className="text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground">Radar score</p>
+            <p className={`mt-1 font-mono text-5xl font-semibold leading-none tracking-tight ${scoreTone(token.scores.final)}`} data-testid="text-selected-score">
               {token.scores.final}
             </p>
           </div>
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-5">
-        <div className="grid gap-3 md:grid-cols-4">
-          <ScorePill label="Velocity" value={token.scores.velocity} />
-          <ScorePill label="Virality" value={token.scores.virality} />
-          <ScorePill label="Upside" value={token.scores.upside} />
-          <ScorePill label="Risk" value={token.scores.risk} danger />
+      <div className="min-h-0 flex-1 overflow-y-auto p-6">
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <ScorePill label="Velocity" value={token.scores.velocity} drivers={velocityDrivers(token)} />
+          <ScorePill label="Virality" value={token.scores.virality} drivers={viralityDrivers(token)} />
+          <ScorePill label="Upside" value={token.scores.upside} drivers={upsideDrivers(token)} />
+          <ScorePill label="Risk" value={token.scores.risk} drivers={riskDrivers(token)} danger />
         </div>
 
-        <div className="mt-5 grid gap-4 xl:grid-cols-[1fr_280px]">
-          <Card className="border-border bg-background/50">
-            <CardContent className="p-4">
-              <div className="mb-3 flex items-center justify-between">
-                <h2 className="text-sm font-semibold">Volume pace</h2>
-                <span className="text-xs text-muted-foreground">5m annualized to hour</span>
-              </div>
-              <div className="h-56" data-testid="chart-volume-pace">
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={chartData} margin={{ left: 0, right: 8, top: 8, bottom: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                    <XAxis dataKey="label" stroke="hsl(var(--muted-foreground))" fontSize={12} />
-                    <YAxis stroke="hsl(var(--muted-foreground))" fontSize={12} tickFormatter={(value) => fmtMoney(Number(value)).replace("$", "")} width={48} />
-                    <ChartTooltip
-                      contentStyle={{
-                        background: "hsl(var(--popover))",
-                        border: "1px solid hsl(var(--border))",
-                        borderRadius: 10,
-                        color: "hsl(var(--foreground))",
-                      }}
-                      formatter={(value: number) => fmtMoney(value)}
-                    />
-                    <Area type="monotone" dataKey="volume" stroke="hsl(var(--primary))" fill="hsl(var(--primary) / 0.18)" strokeWidth={2} />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-            </CardContent>
-          </Card>
+        <div className="mt-5">
+          {chartUrl ? (
+            <div className="overflow-hidden rounded-2xl border border-border bg-background">
+              <iframe
+                src={chartUrl}
+                title={`${token.symbol} chart`}
+                className="block h-[420px] w-full border-0"
+                loading="lazy"
+                data-testid="iframe-chart"
+              />
+            </div>
+          ) : (
+            <div className="rounded-2xl border border-border bg-background p-8 text-center" data-testid="chart-no-pair">
+              <p className="text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground">No pair indexed yet</p>
+              <p className="mt-2 font-body text-sm text-muted-foreground">
+                This mint is fresh from the gRPC stream — DexScreener has not picked up a pool yet. Holders + signatures still load below.
+              </p>
+            </div>
+          )}
+        </div>
 
-          <Card className="border-border bg-background/50">
-            <CardContent className="space-y-3 p-4">
-              <h2 className="text-sm font-semibold">Live tape</h2>
-              {[
-                ["5m volume", fmtMoney(token.volume.m5)],
-                ["1h volume", fmtMoney(token.volume.h1)],
-                ["Liquidity", fmtMoney(token.liquidityUsd)],
-                ["Age", fmtAge(token.pairAgeMinutes)],
-                ["Boost", token.boostAmount ? `${token.boostAmount} units` : "none"],
-                ["DEX", token.dexId],
-              ].map(([label, value]) => (
-                <div key={label} className="flex items-center justify-between border-b border-border/60 pb-2 last:border-b-0" data-testid={`metric-${label.toLowerCase().replace(/\s/g, "-")}`}>
-                  <span className="text-xs text-muted-foreground">{label}</span>
-                  <span className="font-mono text-sm">{value}</span>
-                </div>
-              ))}
-            </CardContent>
-          </Card>
+        <div className="mt-5 grid gap-4 xl:grid-cols-2">
+          <HoldersCard data={holders} error={holdersError} loading={holdersLoading} />
+          <TradesCard data={trades} error={tradesError} loading={tradesLoading} />
         </div>
 
         <div className="mt-5 grid gap-4 xl:grid-cols-3">
-          <Card className="border-border bg-background/50 xl:col-span-2">
-            <CardContent className="p-4">
-              <div className="mb-2 flex items-center gap-2">
-                <Sparkles className="h-4 w-4 text-primary" />
-                <h2 className="text-sm font-semibold">What is the meme?</h2>
-              </div>
-              <p className="text-sm leading-6 text-muted-foreground" data-testid="text-meme-decode">
-                {token.memeDecode}
-              </p>
-              <div className="mt-4 grid gap-3 md:grid-cols-2">
-                <div className="rounded-lg bg-muted/60 p-3">
-                  <p className="mb-1 text-xs font-medium">Virality read</p>
-                  <p className="text-xs leading-5 text-muted-foreground">{token.viralityThesis}</p>
-                </div>
-                <div className="rounded-lg bg-muted/60 p-3">
-                  <p className="mb-1 text-xs font-medium">Upside read</p>
-                  <p className="text-xs leading-5 text-muted-foreground">{token.upsideThesis}</p>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
+          <div className="rounded-2xl border border-border bg-background p-5 xl:col-span-2">
+            <p className="text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground">What is the meme?</p>
+            <p className="mt-3 font-body text-sm leading-relaxed text-foreground/80" data-testid="text-meme-decode">
+              {token.memeDecode}
+            </p>
+          </div>
 
-          <Card className="border-border bg-background/50">
-            <CardContent className="p-4">
-              <div className="mb-2 flex items-center gap-2">
-                <ShieldAlert className="h-4 w-4 text-amber-600 dark:text-amber-300" />
-                <h2 className="text-sm font-semibold">Risk note</h2>
-              </div>
-              <p className="text-sm leading-6 text-muted-foreground" data-testid="text-danger-note">
-                {token.dangerNote}
-              </p>
-              <div className="mt-4 flex flex-wrap gap-2">
-                {token.riskFlags.length ? token.riskFlags.map((flag) => (
-                  <Badge key={flag} variant="outline" className="border-amber-500/40 text-amber-700 dark:text-amber-200">
-                    {flag}
-                  </Badge>
-                )) : <Badge variant="outline">scanner clean</Badge>}
-              </div>
-            </CardContent>
-          </Card>
+          <div className="rounded-2xl border border-border bg-background p-5">
+            <p className="text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground">Risk note</p>
+            <p className="mt-3 font-body text-xs leading-relaxed text-foreground/80" data-testid="text-danger-note">
+              {token.dangerNote}
+            </p>
+            <div className="mt-4 flex flex-wrap gap-1.5">
+              {token.riskFlags.length ? token.riskFlags.map((flag) => (
+                <span key={flag} className="rounded-full border border-destructive/40 px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider text-destructive">
+                  {flag}
+                </span>
+              )) : <span className="rounded-full border border-border px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">scanner clean</span>}
+            </div>
+          </div>
         </div>
 
         <div className="mt-5 flex flex-wrap gap-2">
-          <Button asChild variant="default" size="sm" data-testid="link-open-dexscreener">
-            <a href={token.url} target="_blank" rel="noopener noreferrer">
-              Open DexScreener <ExternalLink className="ml-2 h-3.5 w-3.5" />
-            </a>
-          </Button>
+          {token.url ? (
+            <Button asChild variant="default" size="sm" data-testid="link-open-dexscreener">
+              <a href={token.url} target="_blank" rel="noopener noreferrer">
+                Open DexScreener <ExternalLink className="ml-2 h-3.5 w-3.5" />
+              </a>
+            </Button>
+          ) : null}
           <Button variant="outline" size="sm" onClick={onOpenSheet} data-testid="button-open-meme-sheet">
             Full thesis <ChevronDown className="ml-2 h-3.5 w-3.5" />
           </Button>
@@ -484,27 +665,34 @@ function DetailPanel({ token, onOpenSheet }: { token: TokenSignal | undefined; o
 
 function MetaRail({ snapshot }: { snapshot: RadarSnapshot | undefined }) {
   return (
-    <aside className="rounded-xl border border-border bg-card p-4" data-testid="meta-rail">
-      <div className="mb-4 flex items-center justify-between">
-        <h2 className="text-sm font-semibold">Hot metas</h2>
-        <Badge variant="outline">DexScreener</Badge>
+    <aside className="rounded-2xl border border-border bg-card p-5" data-testid="meta-rail">
+      <div className="mb-5 flex items-center justify-between">
+        <p className="text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground">Hot metas</p>
+        <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">dexscreener</span>
       </div>
-      <div className="space-y-3">
-        {snapshot?.metas?.length ? snapshot.metas.slice(0, 6).map((meta) => (
-          <div key={meta.slug} className="rounded-lg bg-background/60 p-3" data-testid={`card-meta-${meta.slug}`}>
-            <div className="flex items-center justify-between gap-3">
-              <div className="flex min-w-0 items-center gap-2">
-                <span aria-hidden="true">{meta.icon}</span>
-                <p className="truncate text-sm font-medium">{meta.name}</p>
+      <div className="divide-y divide-border/60">
+        {snapshot?.metas?.length ? snapshot.metas.slice(0, 6).map((meta, i) => {
+          const change = meta.marketCapChange.h1 ?? 0;
+          const positive = change >= 0;
+          return (
+            <div key={meta.slug} className="py-3 first:pt-0 last:pb-0" data-testid={`card-meta-${meta.slug}`}>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-3">
+                  <span className="font-mono text-[10px] tracking-[0.2em] text-muted-foreground">
+                    {String(i + 1).padStart(2, "0")}
+                  </span>
+                  <span className="h-1 w-1 rounded-full bg-primary" aria-hidden="true" />
+                  <p className="truncate text-sm font-medium">{meta.name}</p>
+                </div>
+                <span className={`flex items-center gap-0.5 font-mono text-xs ${positive ? "text-emerald-400" : "text-red-400"}`}>
+                  {trendIcon(change)}
+                  {fmtPct(change)}
+                </span>
               </div>
-              <span className={`flex items-center gap-0.5 font-mono text-xs ${scoreTone(meta.marketCapChange.h1 ?? 0)}`}>
-                {trendIcon(meta.marketCapChange.h1)}
-                {fmtPct(meta.marketCapChange.h1)}
-              </span>
+              <p className="mt-1 line-clamp-2 pl-9 font-body text-xs leading-relaxed text-muted-foreground">{meta.description}</p>
             </div>
-            <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{meta.description}</p>
-          </div>
-        )) : Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-20 rounded-lg" />)}
+          );
+        }) : Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="my-3 h-12 rounded-lg" />)}
       </div>
     </aside>
   );
@@ -525,71 +713,63 @@ function SnapshotBar({
 }) {
   const generated = snapshot ? new Date(snapshot.generatedAt) : null;
   const okSources = snapshot?.sourceHealth.filter((source) => source.status === "ok").length ?? 0;
+  const totalSources = snapshot?.sourceHealth.length ?? 4;
+  const tile = "rounded-2xl border border-border bg-card p-5";
+  const labelClass = "text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground";
   return (
     <div className="grid gap-3 md:grid-cols-4" data-testid="snapshot-bar">
-      <Card className="border-border bg-card">
-        <CardContent className="flex items-center gap-3 p-4">
-          <div className="rounded-lg bg-primary/10 p-2 text-primary">
-            <SignalHigh className="h-5 w-5" />
-          </div>
-          <div>
-            <p className="text-xs text-muted-foreground">Mode</p>
-            <p className="text-sm font-medium" data-testid="text-data-mode">{snapshot?.dataMode ?? "warming scanner"}</p>
-          </div>
-        </CardContent>
-      </Card>
-      <Card className="border-border bg-card">
-        <CardContent className="flex items-center gap-3 p-4">
-          <div className="rounded-lg bg-emerald-500/10 p-2 text-emerald-600 dark:text-emerald-300">
-            <Gauge className="h-5 w-5" />
-          </div>
-          <div>
-            <p className="text-xs text-muted-foreground">Scanned</p>
-            <p className="font-mono text-sm font-medium" data-testid="text-scanned-count">{snapshot?.scannedTokens ?? "…" } candidates</p>
-          </div>
-        </CardContent>
-      </Card>
-      <Card className="border-border bg-card">
-        <CardContent className="flex items-center gap-3 p-4">
-          <div className="rounded-lg bg-amber-500/10 p-2 text-amber-600 dark:text-amber-300">
-            <Activity className="h-5 w-5" />
-          </div>
-          <div>
-            <p className="text-xs text-muted-foreground">Latency</p>
-            <p className="font-mono text-sm font-medium" data-testid="text-latency">{snapshot ? `${snapshot.latencyMs}ms` : "…"}</p>
-          </div>
-        </CardContent>
-      </Card>
-      <Card className="border-border bg-card">
-        <CardContent className="flex items-center justify-between gap-3 p-4">
-          <div>
-            <p className="text-xs text-muted-foreground">Updated</p>
-            <p className="font-mono text-sm font-medium" data-testid="text-updated-at">{generated ? generated.toLocaleTimeString() : "…"}</p>
-            <p className="text-xs text-muted-foreground">{okSources}/{snapshot?.sourceHealth.length ?? 4} feeds ok</p>
-          </div>
-          <div className="flex gap-2">
-            <Button
-              size="icon"
-              variant={live ? "default" : "outline"}
-              onClick={() => setLive(!live)}
-              aria-label={live ? "Disable live stream" : "Enable live stream"}
-              data-testid="button-toggle-live"
-            >
-              <Zap className="h-4 w-4" />
-            </Button>
-            <Button
-              size="icon"
-              variant="outline"
-              onClick={onRefresh}
-              aria-label="Refresh radar"
-              disabled={refreshing}
-              data-testid="button-refresh"
-            >
-              <RefreshCcw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
+      <div className={tile}>
+        <p className={labelClass}>Mode</p>
+        <p className="mt-2 truncate text-lg font-semibold tracking-tight" data-testid="text-data-mode">
+          {snapshot?.dataMode ?? "warming"}
+        </p>
+      </div>
+      <div className={tile}>
+        <p className={labelClass}>Scanned</p>
+        <p className="mt-2 font-mono text-3xl font-semibold leading-none tracking-tight" data-testid="text-scanned-count">
+          {snapshot?.scannedTokens ?? "—"}
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">candidates</p>
+      </div>
+      <div className={tile}>
+        <p className={labelClass}>Latency</p>
+        <p className="mt-2 font-mono text-3xl font-semibold leading-none tracking-tight" data-testid="text-latency">
+          {snapshot ? snapshot.latencyMs : "—"}
+          <span className="ml-1 text-xs font-normal text-muted-foreground">ms</span>
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">{okSources}/{totalSources} feeds ok</p>
+      </div>
+      <div className={`${tile} flex items-center justify-between`}>
+        <div className="min-w-0">
+          <p className={labelClass}>Updated</p>
+          <p className="mt-2 font-mono text-base font-semibold tracking-tight" data-testid="text-updated-at">
+            {generated ? generated.toLocaleTimeString() : "—"}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <Button
+            size="icon"
+            variant={live ? "default" : "outline"}
+            onClick={() => setLive(!live)}
+            aria-label={live ? "Disable live stream" : "Enable live stream"}
+            data-testid="button-toggle-live"
+            className="rounded-full"
+          >
+            <Zap className="h-4 w-4" />
+          </Button>
+          <Button
+            size="icon"
+            variant="outline"
+            onClick={onRefresh}
+            aria-label="Refresh radar"
+            disabled={refreshing}
+            data-testid="button-refresh"
+            className="rounded-full"
+          >
+            <RefreshCcw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -625,6 +805,66 @@ function exportCsv(tokens: TokenSignal[]) {
   URL.revokeObjectURL(url);
 }
 
+function BrokenScreen({
+  snapshot,
+  onRetry,
+  retrying,
+}: {
+  snapshot: RadarSnapshot | undefined;
+  onRetry: () => void;
+  retrying: boolean;
+}) {
+  const sources = snapshot?.brokenSources ?? [];
+  return (
+    <div className="min-h-screen bg-background" data-testid="broken-screen">
+      <div className="mx-auto max-w-2xl px-6 py-16">
+        <div className="mb-6 flex items-center gap-3">
+          <div className="rounded-lg bg-destructive/10 p-2 text-destructive">
+            <AlertTriangle className="h-6 w-6" />
+          </div>
+          <div>
+            <h1 className="text-xl font-semibold tracking-tight">Radar is broken</h1>
+            <p className="text-sm text-muted-foreground">
+              At least one required upstream is not delivering. We never serve a degraded radar — fix the source(s) below to restore.
+            </p>
+          </div>
+        </div>
+        <Card className="border-destructive/30">
+          <CardContent className="p-5">
+            <p className="mb-3 text-xs font-medium uppercase tracking-wider text-muted-foreground">
+              Broken sources ({sources.length})
+            </p>
+            {sources.length ? (
+              <ul className="space-y-2">
+                {sources.map((line, i) => (
+                  <li
+                    key={`${i}-${line}`}
+                    className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 font-mono text-xs"
+                    data-testid={`broken-source-${i}`}
+                  >
+                    {line}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-sm text-muted-foreground">No source detail returned.</p>
+            )}
+            <div className="mt-5 flex flex-wrap gap-2">
+              <Button onClick={onRetry} disabled={retrying} data-testid="button-broken-retry">
+                <RefreshCcw className={`mr-2 h-4 w-4 ${retrying ? "animate-spin" : ""}`} />
+                Retry
+              </Button>
+              <Button variant="outline" asChild data-testid="link-broken-raw">
+                <a href="#/raw">Open raw feed</a>
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
 function RadarHome() {
   const { theme, setTheme } = useTheme();
   const [live, setLive] = useState(true);
@@ -654,6 +894,34 @@ function RadarHome() {
   });
 
   const snapshot = streamSnapshot ?? data;
+
+  const selectedMint = useMemo(() => {
+    const tokens = (streamSnapshot ?? data)?.tokens ?? [];
+    const sel = tokens.find((t) => t.id === selectedId) ?? tokens[0];
+    return sel?.tokenAddress ?? null;
+  }, [streamSnapshot, data, selectedId]);
+
+  const {
+    data: holders,
+    error: holdersError,
+    isLoading: holdersLoading,
+  } = useQuery<HoldersResponse>({
+    queryKey: ["/api/token", selectedMint, "holders"],
+    enabled: !!selectedMint,
+    refetchInterval: 30_000,
+    staleTime: 20_000,
+  });
+
+  const {
+    data: trades,
+    error: tradesError,
+    isLoading: tradesLoading,
+  } = useQuery<TradesResponse>({
+    queryKey: ["/api/token", selectedMint, "trades"],
+    enabled: !!selectedMint,
+    refetchInterval: 15_000,
+    staleTime: 10_000,
+  });
 
   useEffect(() => {
     if (!live) return undefined;
@@ -708,6 +976,10 @@ function RadarHome() {
     }
   }
 
+  if (snapshot && snapshot.status === "broken") {
+    return <BrokenScreen snapshot={snapshot} onRetry={hardRefresh} retrying={refreshing} />;
+  }
+
   return (
     <div className="dashboard-shell">
       <aside className="sidebar-panel">
@@ -748,6 +1020,17 @@ function RadarHome() {
           ))}
         </div>
 
+        <div className="mt-6">
+          <a
+            href="#/raw"
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-muted-foreground transition hover:bg-accent hover:text-foreground"
+            data-testid="link-raw-feed"
+          >
+            <Activity className="h-4 w-4" />
+            Raw feed
+          </a>
+        </div>
+
         <div className="mt-8">
           <MetaRail snapshot={snapshot} />
         </div>
@@ -765,8 +1048,8 @@ function RadarHome() {
                 <SvsBadge health={svsHealth} />
                 <GrpcBadge status={grpcStatus} />
               </div>
-              <h1 className="text-xl font-semibold tracking-tight">Fast memecoin velocity radar</h1>
-              <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
+              <h1 className="text-3xl font-semibold leading-tight tracking-tight">Velocity radar</h1>
+              <p className="mt-2 max-w-2xl font-body text-sm leading-relaxed text-muted-foreground">
                 Tracks Solana tokens that are starting to move, decodes the meme, then scores velocity, virality, upside, and risk from live indexed DEX data.
               </p>
             </div>
@@ -827,10 +1110,11 @@ function RadarHome() {
           ) : (
             <div className="grid min-h-[640px] gap-5 xl:grid-cols-[420px_1fr]">
               <section className="min-h-0 space-y-3 xl:max-h-[calc(100dvh-285px)] xl:overflow-y-auto xl:pr-1" data-testid="token-list">
-                {visibleTokens.length ? visibleTokens.map((token) => (
+                {visibleTokens.length ? visibleTokens.map((token, idx) => (
                   <TokenCard
                     key={token.id}
                     token={token}
+                    index={idx}
                     active={selectedToken?.id === token.id}
                     onSelect={(next) => setSelectedId(next.id)}
                   />
@@ -844,7 +1128,16 @@ function RadarHome() {
                   </Card>
                 )}
               </section>
-              <DetailPanel token={selectedToken} onOpenSheet={() => setSheetOpen(true)} />
+              <DetailPanel
+                token={selectedToken}
+                onOpenSheet={() => setSheetOpen(true)}
+                holders={holders}
+                holdersError={holdersError}
+                holdersLoading={holdersLoading}
+                trades={trades}
+                tradesError={tradesError}
+                tradesLoading={tradesLoading}
+              />
             </div>
           )}
         </div>
@@ -862,10 +1155,10 @@ function RadarHome() {
                 <p className="text-sm leading-6 text-muted-foreground">{selectedToken.memeDecode}</p>
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
-                <ScorePill label="Velocity" value={selectedToken.scores.velocity} />
-                <ScorePill label="Virality" value={selectedToken.scores.virality} />
-                <ScorePill label="Upside" value={selectedToken.scores.upside} />
-                <ScorePill label="Risk" value={selectedToken.scores.risk} danger />
+                <ScorePill label="Velocity" value={selectedToken.scores.velocity} drivers={velocityDrivers(selectedToken)} />
+                <ScorePill label="Virality" value={selectedToken.scores.virality} drivers={viralityDrivers(selectedToken)} />
+                <ScorePill label="Upside" value={selectedToken.scores.upside} drivers={upsideDrivers(selectedToken)} />
+                <ScorePill label="Risk" value={selectedToken.scores.risk} drivers={riskDrivers(selectedToken)} danger />
               </div>
               <div>
                 <p className="mb-2 text-sm font-semibold">Opportunity flags</p>
@@ -903,6 +1196,7 @@ function AppRouter() {
   return (
     <Switch>
       <Route path="/" component={RadarHome} />
+      <Route path="/raw" component={RawFeedPage} />
       <Route component={NotFound} />
     </Switch>
   );

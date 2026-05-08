@@ -8,6 +8,7 @@
 
 import bs58 from "bs58";
 import { decodeLaunchEvent, type LaunchEvent } from "./decoders";
+import { emit as emitFeed } from "./feed";
 
 type GrpcStatusKind =
   | "disabled"
@@ -192,7 +193,7 @@ class CandidateStore {
     launchEvent?: LaunchEvent | null;
     creatorWallet?: string | null;
     decimals?: number | null;
-  }) {
+  }): { candidate: GrpcCandidate; isNew: boolean } {
     const now = new Date().toISOString();
     const sourceName = WATCH_BY_ID.get(record.sourceProgramId) ?? "unknown-program";
     const launchEvent = record.launchEvent ?? null;
@@ -222,7 +223,7 @@ class CandidateStore {
       }
       this.map.delete(record.mint);
       this.map.set(record.mint, existing);
-      return existing;
+      return { candidate: existing, isNew: false };
     }
     const decoderTags = launchEvent ? [`${launchEvent.protocol}:${launchEvent.instruction}`, `event:${launchEvent.type}`] : [];
     const created: GrpcCandidate = {
@@ -242,7 +243,7 @@ class CandidateStore {
     };
     this.map.set(record.mint, created);
     this.evict();
-    return created;
+    return { candidate: created, isNew: true };
   }
 
   private evict() {
@@ -297,8 +298,15 @@ const decodedEventCounts: Record<string, number> = {};
 let lastDecodedEvent: GrpcDiagnostics["lastDecodedEvent"] = null;
 const PROGRAM_IDS_BY_NAME = new Map(WATCH_PROGRAMS.map((p) => [p.name, p.programId]));
 
-function bumpReason(reason: string) {
+function bumpReason(reason: string, ctx?: { slot?: number; signature?: string | null }) {
   ignoredReasonCounts[reason] = (ignoredReasonCounts[reason] ?? 0) + 1;
+  emitFeed({
+    stage: "grpc.tx.ignored",
+    summary: `ignored: ${reason}`,
+    reason,
+    slot: ctx?.slot,
+    signature: ctx?.signature ?? undefined,
+  });
 }
 
 function eventsPerMinute(): number {
@@ -408,11 +416,11 @@ function processTransactionUpdate(update: any) {
   const info = txWrapper.transaction;
   if (!info) return;
   if (info.isVote) {
-    bumpReason("vote-tx");
+    bumpReason("vote-tx", { slot: Number(txWrapper.slot ?? 0) });
     return;
   }
   if (info.meta?.err) {
-    bumpReason("failed-tx");
+    bumpReason("failed-tx", { slot: Number(txWrapper.slot ?? 0) });
     return;
   }
 
@@ -423,32 +431,44 @@ function processTransactionUpdate(update: any) {
     eventsByFilter[f] = (eventsByFilter[f] ?? 0) + 1;
   }
 
+  const slotForCtx = Number(txWrapper.slot ?? 0);
+  const sigForCtx = extractSignature(info);
+
   const accountKeys = extractAccountKeys(info);
   if (!accountKeys.length) {
-    bumpReason("no-account-keys");
+    bumpReason("no-account-keys", { slot: slotForCtx, signature: sigForCtx });
     return;
   }
   const watched = findWatchedProgram(accountKeys);
   if (!watched) {
-    bumpReason("no-watched-program-in-tx");
+    bumpReason("no-watched-program-in-tx", { slot: slotForCtx, signature: sigForCtx });
     return;
   }
   for (const name of watched.observedPrograms) {
     eventsByProgram[name] = (eventsByProgram[name] ?? 0) + 1;
   }
-  const signature = extractSignature(info);
+  const signature = sigForCtx;
   if (!signature) {
-    bumpReason("missing-signature");
+    bumpReason("missing-signature", { slot: slotForCtx });
     return;
   }
-  const slot = Number(txWrapper.slot ?? 0);
+  const slot = slotForCtx;
+  emitFeed({
+    stage: "grpc.tx.received",
+    summary: `${watched.observedPrograms.join(",")} · slot ${slot}`,
+    slot,
+    signature,
+    filters: filterNames,
+    programs: watched.observedPrograms,
+    txCount: eventsReceived,
+  });
   const { mints, hadAnyTokenBalances, ignoredStable } = extractMints(info);
   if (hadAnyTokenBalances) eventsWithTokenBalances++;
   if (ignoredStable) ignoredBaseMintCount += ignoredStable;
   if (!mints.length) {
-    if (!hadAnyTokenBalances) bumpReason("no-token-balances");
-    else if (ignoredStable) bumpReason("only-stable-mints");
-    else bumpReason("no-candidate-mints");
+    if (!hadAnyTokenBalances) bumpReason("no-token-balances", { slot, signature });
+    else if (ignoredStable) bumpReason("only-stable-mints", { slot, signature });
+    else bumpReason("no-candidate-mints", { slot, signature });
     return;
   }
   eventsWithCandidateMints++;
@@ -476,13 +496,24 @@ function processTransactionUpdate(update: any) {
       mint: decoded.mint,
       at: new Date().toISOString(),
     };
+    emitFeed({
+      stage: "grpc.decode.matched",
+      summary: `${decoded.protocol}:${decoded.instruction} → ${decoded.type}${decoded.mint ? ` · ${decoded.mint.slice(0, 4)}…${decoded.mint.slice(-4)}` : ""}`,
+      protocol: decoded.protocol,
+      instruction: decoded.instruction,
+      type: decoded.type,
+      mint: decoded.mint,
+      creator: decoded.creator ?? null,
+      signature,
+      slot,
+    });
   }
   // Prefer the decoder's mint when present; otherwise emit a candidate per
   // mint extracted from token balances.
   const decoderMint = decoded?.mint;
   const mintsToEmit = decoderMint && !mints.includes(decoderMint) ? [decoderMint, ...mints] : mints;
   for (const mint of mintsToEmit) {
-    candidates.upsert({
+    const { candidate, isNew } = candidates.upsert({
       mint,
       signature,
       slot,
@@ -493,6 +524,15 @@ function processTransactionUpdate(update: any) {
       launchEvent: !decoded ? null : decoderMint ? (mint === decoderMint ? decoded : null) : decoded,
       creatorWallet: decoded?.creator ?? null,
       decimals: decoded?.decimals ?? null,
+    });
+    emitFeed({
+      stage: "grpc.candidate.upserted",
+      summary: `${isNew ? "new" : "updated"} ${candidate.source} · ${mint.slice(0, 4)}…${mint.slice(-4)} · ${candidate.txCount} tx`,
+      mint,
+      source: candidate.source,
+      eventType: candidate.eventType,
+      txCount: candidate.txCount,
+      isNew,
     });
   }
   lastCandidateAt = Date.now();
@@ -512,6 +552,10 @@ async function runStreamOnce(endpoint: string, token: string | undefined) {
   status = "connected";
   lastError = null;
   const stream = await client.subscribe();
+  // Default no-op error handler so late-fired errors (e.g. from the keepalive
+  // ping after the connection closed) never reach Node's "unhandledError" path
+  // and crash the process. The named handler below still drives reconnect.
+  stream.on("error", () => {});
   activeStreams = 1;
 
   const { filters, filterNames } = buildFilters();

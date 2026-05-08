@@ -6,8 +6,14 @@ import {
   fetchSvsMetadata,
   fetchSvsMintInfo,
   fetchSvsPrices,
+  fetchTokenLargestAccounts,
+  fetchTokenSupply,
+  fetchSignaturesForAddress,
   getSvsConfig,
   getSvsHealthReport,
+  isRpcNotConfigured,
+  type LargestAccountEntry,
+  type SignatureEntry,
   type SvsMetadataRecord,
   type SvsMintInfoRecord,
   type SvsPriceRecord,
@@ -17,6 +23,7 @@ import {
   getRecentGrpcCandidates,
   type GrpcCandidate,
 } from "./grpcStream";
+import { emit as emitFeed, recent as feedRecent, subscribe as feedSubscribe } from "./feed";
 
 type DexLink = { type?: string; label?: string; url?: string };
 type TokenProfile = {
@@ -72,9 +79,22 @@ type DexMeta = {
 };
 
 const DEX = "https://api.dexscreener.com";
-const CACHE_MS = 25_000;
-const REFRESH_SECONDS = 20;
-const MAX_CANDIDATES = 14;
+// Tuned for SVS Ultra (250 r/s). DexScreener is the remaining bottleneck —
+// keep CACHE_MS / REFRESH_SECONDS ≥ 5s so pair-fetch waves stay under
+// DexScreener's ~5 r/s public limit. Going lower will trigger 429s.
+const CACHE_MS = 5_000;
+const REFRESH_SECONDS = 5;
+const MAX_CANDIDATES = 30;
+const DEX_FEED_TIMEOUT_MS = 4_000;
+const DEX_PAIR_TIMEOUT_MS = 3_500;
+const DEX_HARD_DEADLINE_GRACE_MS = 1_000;
+const PAIR_FETCH_CONCURRENCY = MAX_CANDIDATES;
+const SVS_ENRICHMENT_CANDIDATE_LIMIT = 24;
+const SVS_METADATA_BUDGET_MS = 2_500;
+const SVS_PRICE_BUDGET_MS = 2_500;
+const SVS_MINT_INFO_LIMIT = 8;
+const SVS_MINT_INFO_BUDGET_MS = 1_250;
+const BUILD_DEADLINE_RESERVE_MS = 1_500;
 // Hard cap on the total time /api/radar will spend building a snapshot. If
 // fetches are slow or the event loop is starved, we return whatever we have
 // (or the last good snapshot) instead of hanging the request for minutes.
@@ -145,12 +165,13 @@ async function fetchJson<T>(path: string, label: string, timeoutMs = 6_000): Pro
       // ignore
     }
   }, timeoutMs);
+  const start = Date.now();
   // Wrap the fetch in a hard deadline to defend against event-loop starvation
   // where the AbortController's setTimeout might be delayed past the timeout.
   const hardDeadline = new Promise<{ ok: false; error: string; label: string }>((resolve) => {
     setTimeout(
-      () => resolve({ ok: false, error: `hard deadline ${timeoutMs + 2_000}ms`, label }),
-      timeoutMs + 2_000,
+      () => resolve({ ok: false, error: `hard deadline ${timeoutMs + DEX_HARD_DEADLINE_GRACE_MS}ms`, label }),
+      timeoutMs + DEX_HARD_DEADLINE_GRACE_MS,
     );
   });
   try {
@@ -171,6 +192,18 @@ async function fetchJson<T>(path: string, label: string, timeoutMs = 6_000): Pro
       })(),
       hardDeadline,
     ]);
+    const ms = Date.now() - start;
+    const count = result.ok && Array.isArray(result.data) ? (result.data as unknown[]).length : undefined;
+    emitFeed({
+      stage: "dex.fetch",
+      summary: `${label} · ${ms}ms · ${result.ok ? `ok${count != null ? ` · ${count} items` : ""}` : `err: ${result.error}`}`,
+      path,
+      label,
+      ms,
+      ok: result.ok,
+      status: result.ok ? undefined : result.error,
+      count,
+    });
     return result;
   } finally {
     clearTimeout(timer);
@@ -188,6 +221,33 @@ async function mapPool<T, R>(items: T[], limit: number, mapper: (item: T) => Pro
   }
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   return results;
+}
+
+type SvsMapResult<T extends { mint?: string }> =
+  | { ok: true; map: Map<string, T> }
+  | { ok: false; error: string };
+
+function remainingBuildBudgetMs(started: number, reserveMs = BUILD_DEADLINE_RESERVE_MS) {
+  return Math.max(0, RADAR_BUILD_DEADLINE_MS - (Date.now() - started) - reserveMs);
+}
+
+async function withSvsBuildBudget<T extends { mint?: string }>(
+  label: string,
+  started: number,
+  budgetMs: number,
+  work: () => Promise<SvsMapResult<T>>,
+): Promise<SvsMapResult<T>> {
+  const ms = Math.min(budgetMs, remainingBuildBudgetMs(started));
+  if (ms <= 0) {
+    return { ok: false, error: `${label} skipped — radar build budget exhausted` };
+  }
+
+  return Promise.race([
+    work(),
+    new Promise<SvsMapResult<T>>((resolve) => {
+      setTimeout(() => resolve({ ok: false, error: `${label} skipped after ${ms}ms radar budget` }), ms);
+    }),
+  ]);
 }
 
 function getTxns(pair: DexPair, window: "m5" | "h1" | "h6" | "h24") {
@@ -557,10 +617,10 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
 
   const started = Date.now();
   const [boostsResult, profilesResult, updatesResult, metasResult] = await Promise.all([
-    fetchJson<TokenProfile[]>("/token-boosts/latest/v1", "boosts"),
-    fetchJson<TokenProfile[]>("/token-profiles/latest/v1", "profiles"),
-    fetchJson<TokenProfile[]>("/token-profiles/recent-updates/v1", "profile updates"),
-    fetchJson<DexMeta[]>("/metas/trending/v1", "metas"),
+    fetchJson<TokenProfile[]>("/token-boosts/latest/v1", "boosts", DEX_FEED_TIMEOUT_MS),
+    fetchJson<TokenProfile[]>("/token-profiles/latest/v1", "profiles", DEX_FEED_TIMEOUT_MS),
+    fetchJson<TokenProfile[]>("/token-profiles/recent-updates/v1", "profile updates", DEX_FEED_TIMEOUT_MS),
+    fetchJson<DexMeta[]>("/metas/trending/v1", "metas", DEX_FEED_TIMEOUT_MS),
   ]);
 
   const sourceHealth: RadarSnapshot["sourceHealth"] = [];
@@ -612,8 +672,8 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
   ] as string[];
   // gRPC candidates get priority but we still cap total candidates to keep DexScreener calls bounded.
   const candidates = Array.from(new Set(prioritizedCandidates)).slice(0, MAX_CANDIDATES);
-  const pairResults = await mapPool(candidates, 7, async (address) => {
-    const result = await fetchJson<DexPair[]>(`/token-pairs/v1/solana/${address}`, `pairs:${address}`, 6_000);
+  const pairResults = await mapPool(candidates, PAIR_FETCH_CONCURRENCY, async (address) => {
+    const result = await fetchJson<DexPair[]>(`/token-pairs/v1/solana/${address}`, `pairs:${address}`, DEX_PAIR_TIMEOUT_MS);
     if (!result.ok) {
       sourceHealth.push({ name: `pairs:${address.slice(0, 4)}…`, status: "degraded", detail: result.error });
       return { address, pairs: [] };
@@ -627,16 +687,51 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
   let svsMetadataMap = new Map<string, SvsMetadataRecord>();
   let svsPriceMap = new Map<string, SvsPriceRecord>();
   if (svsConfig.hasApiKey && candidates.length) {
-    const [metaResult, priceResult] = await Promise.all([
-      fetchSvsMetadata(candidates),
-      fetchSvsPrices(candidates),
-    ]);
+    const svsCandidates = candidates.slice(0, SVS_ENRICHMENT_CANDIDATE_LIMIT);
+    // Sequential, not parallel — free SVS tier is 10 r/s, parallel batches
+    // can blow the budget. Cache layer in svs.ts means most snapshots are
+    // mostly cache hits anyway. SVS is optional, so each leg also has a small
+    // build budget and can degrade without delaying the radar.
+    const metaStart = Date.now();
+    const metaResult = await withSvsBuildBudget<SvsMetadataRecord>("metadata", started, SVS_METADATA_BUDGET_MS, () => {
+      return fetchSvsMetadata(svsCandidates);
+    });
+    {
+      const ms = Date.now() - metaStart;
+      emitFeed({
+        stage: "svs.fetch",
+        summary: `metadata · ${svsCandidates.length}/${candidates.length} mints · ${ms}ms · ${metaResult.ok ? `${metaResult.map.size} returned` : `err: ${metaResult.error}`}`,
+        kind: "metadata",
+        mints: svsCandidates.length,
+        ms,
+        ok: metaResult.ok,
+        returned: metaResult.ok ? metaResult.map.size : 0,
+        error: metaResult.ok ? undefined : metaResult.error,
+      });
+    }
+    const priceStart = Date.now();
+    const priceResult = await withSvsBuildBudget<SvsPriceRecord>("price", started, SVS_PRICE_BUDGET_MS, () => {
+      return fetchSvsPrices(svsCandidates);
+    });
+    {
+      const ms = Date.now() - priceStart;
+      emitFeed({
+        stage: "svs.fetch",
+        summary: `price · ${svsCandidates.length}/${candidates.length} mints · ${ms}ms · ${priceResult.ok ? `${priceResult.map.size} returned` : `err: ${priceResult.error}`}`,
+        kind: "price",
+        mints: svsCandidates.length,
+        ms,
+        ok: priceResult.ok,
+        returned: priceResult.ok ? priceResult.map.size : 0,
+        error: priceResult.ok ? undefined : priceResult.error,
+      });
+    }
     if (metaResult.ok) {
       svsMetadataMap = metaResult.map;
       sourceHealth.push({
         name: "svs-metadata",
         status: metaResult.map.size ? "ok" : "degraded",
-        detail: metaResult.map.size ? `${metaResult.map.size}/${candidates.length} mints` : "no metadata returned",
+        detail: metaResult.map.size ? `${metaResult.map.size}/${svsCandidates.length} mints` : "no metadata returned",
       });
     } else {
       sourceHealth.push({ name: "svs-metadata", status: "degraded", detail: metaResult.error });
@@ -646,7 +741,7 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
       sourceHealth.push({
         name: "svs-price",
         status: priceResult.map.size ? "ok" : "degraded",
-        detail: priceResult.map.size ? `${priceResult.map.size}/${candidates.length} mints` : "no price returned",
+        detail: priceResult.map.size ? `${priceResult.map.size}/${svsCandidates.length} mints` : "no price returned",
       });
     } else {
       sourceHealth.push({ name: "svs-price", status: "degraded", detail: priceResult.error });
@@ -720,8 +815,24 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
   // Optional mint_info enrichment for the top short-list. Concurrency-limited
   // and tolerant: if it fails, we keep the snapshot we already have.
   if (svsConfig.hasApiKey && tokens.length) {
-    const topMints = tokens.slice(0, 6).map((token) => token.tokenAddress);
-    const mintInfoResult = await fetchSvsMintInfo(topMints, 3);
+    const topMints = tokens.slice(0, SVS_MINT_INFO_LIMIT).map((token) => token.tokenAddress);
+    const mintInfoStart = Date.now();
+    const mintInfoResult = await withSvsBuildBudget<SvsMintInfoRecord>("mint_info", started, SVS_MINT_INFO_BUDGET_MS, () => {
+      return fetchSvsMintInfo(topMints, 1);
+    });
+    {
+      const ms = Date.now() - mintInfoStart;
+      emitFeed({
+        stage: "svs.fetch",
+        summary: `mint_info · ${topMints.length} mints · ${ms}ms · ${mintInfoResult.ok ? `${mintInfoResult.map.size} returned` : `err: ${mintInfoResult.error}`}`,
+        kind: "mint_info",
+        mints: topMints.length,
+        ms,
+        ok: mintInfoResult.ok,
+        returned: mintInfoResult.ok ? mintInfoResult.map.size : 0,
+        error: mintInfoResult.ok ? undefined : mintInfoResult.error,
+      });
+    }
     if (mintInfoResult.ok && mintInfoResult.map.size) {
       mintInfoResult.map.forEach((info, mint) => {
         const target = tokens.find((token) => token.tokenAddress === mint);
@@ -755,6 +866,18 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
     sourceHealth.push({ name: "svs-grpc", status: "missing", detail: "SVS_GRPC_ENDPOINT not set" });
   }
 
+  // Hard health gate: only required public seed feeds can break the radar.
+  // SVS REST/gRPC enrichments are optional; when they rate-limit or are absent,
+  // the snapshot should continue with DexScreener-backed data.
+  const brokenSources: string[] = [];
+  for (const src of sourceHealth) {
+    const isRequiredSeed = ["token boosts", "token profiles", "profile updates", "trending metas"].includes(src.name);
+    if (isRequiredSeed && src.status !== "ok") {
+      brokenSources.push(`${src.name}: ${src.status}${src.detail ? ` — ${src.detail}` : ""}`);
+    }
+  }
+  const status: "ok" | "broken" = brokenSources.length ? "broken" : "ok";
+
   const snapshot: RadarSnapshot = {
     generatedAt: new Date().toISOString(),
     latencyMs: Date.now() - started,
@@ -776,22 +899,13 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
       eventsPerMinute: grpcStatus.eventsPerMinute,
       candidateCount: grpcStatus.candidateCount,
     },
+    status,
+    brokenSources,
   };
 
-  if (!snapshot.tokens.length && (candidates.length === 0 || sourceHealth.some((source) => source.status === "error"))) {
-    const fallback = await latestUsableSnapshot();
-    if (fallback) {
-      fallback.sourceHealth = [
-        { name: "stale-while-rate-limited", status: "degraded", detail: "serving last non-empty scan while public feeds recover" },
-        ...sourceHealth,
-      ];
-      fallback.generatedAt = new Date().toISOString();
-      fallback.latencyMs = Date.now() - started;
-      memoryCache = { expires: Date.now() + CACHE_MS, snapshot: fallback };
-      return fallback;
-    }
-  }
-
+  // No stale-while-rate-limited fallback: if the live scan is broken we want
+  // the broken status to surface to the client, not a stale radar dressed up
+  // as fresh.
   memoryCache = { expires: Date.now() + CACHE_MS, snapshot };
   if (snapshot.tokens.length) lastGoodSnapshot = snapshot;
   storage
@@ -800,19 +914,22 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
       payload: JSON.stringify(snapshot),
     })
     .catch(() => undefined);
+  const healthCounts = snapshot.sourceHealth.reduce(
+    (acc, src) => {
+      acc[src.status] = (acc[src.status] ?? 0) + 1;
+      return acc;
+    },
+    { ok: 0, degraded: 0, error: 0, missing: 0 } as Record<"ok" | "degraded" | "error" | "missing", number>,
+  );
+  emitFeed({
+    stage: "radar.snapshot",
+    summary: `${snapshot.tokens.length} tokens · ${candidates.length} candidates · ${snapshot.latencyMs}ms · ${healthCounts.ok}/${snapshot.sourceHealth.length} ok`,
+    tokens: snapshot.tokens.length,
+    candidates: candidates.length,
+    latencyMs: snapshot.latencyMs,
+    sourceHealth: healthCounts,
+  });
   return snapshot;
-}
-
-async function latestUsableSnapshot(): Promise<RadarSnapshot | null> {
-  if (lastGoodSnapshot?.tokens.length) return structuredClone(lastGoodSnapshot);
-  const latest = await storage.getLatestRadarSnapshot().catch(() => undefined);
-  if (!latest) return null;
-  try {
-    const parsed = JSON.parse(latest.payload) as RadarSnapshot;
-    return parsed.tokens?.length ? parsed : null;
-  } catch {
-    return null;
-  }
 }
 
 async function buildSnapshotWithDeadline(force: boolean): Promise<RadarSnapshot> {
@@ -835,36 +952,16 @@ async function buildSnapshotWithDeadline(force: boolean): Promise<RadarSnapshot>
   }
 
   return withDeadline(inflightSnapshot, RADAR_BUILD_DEADLINE_MS, () => {
-    const fallback =
-      (memoryCache?.snapshot && structuredClone(memoryCache.snapshot)) ||
-      (lastGoodSnapshot && structuredClone(lastGoodSnapshot)) ||
-      null;
-    if (fallback) {
-      fallback.sourceHealth = [
-        {
-          name: "deadline",
-          status: "degraded",
-          detail: `radar build exceeded ${RADAR_BUILD_DEADLINE_MS}ms — serving last cached snapshot`,
-        },
-        ...(fallback.sourceHealth ?? []),
-      ];
-      return fallback;
-    }
-    // No cache yet — return an empty but well-formed snapshot rather than hanging.
+    // Deadline exceeded → broken. We don't dress a stale snapshot as fresh.
     const grpcStatus = getGrpcStatus();
+    const detail = `radar build exceeded ${RADAR_BUILD_DEADLINE_MS}ms`;
     return {
       generatedAt: new Date().toISOString(),
       latencyMs: RADAR_BUILD_DEADLINE_MS,
       scannedTokens: 0,
-      dataMode: "deadline-fallback",
+      dataMode: "deadline-exceeded",
       refreshSeconds: REFRESH_SECONDS,
-      sourceHealth: [
-        {
-          name: "deadline",
-          status: "degraded",
-          detail: `radar build exceeded ${RADAR_BUILD_DEADLINE_MS}ms — no cached snapshot available yet`,
-        },
-      ],
+      sourceHealth: [{ name: "deadline", status: "error", detail }],
       metas: [],
       tokens: [],
       grpc: {
@@ -879,6 +976,8 @@ async function buildSnapshotWithDeadline(force: boolean): Promise<RadarSnapshot>
         eventsPerMinute: grpcStatus.eventsPerMinute,
         candidateCount: grpcStatus.candidateCount,
       },
+      status: "broken",
+      brokenSources: [`radar build: ${detail}`],
     } as RadarSnapshot;
   });
 }
@@ -921,22 +1020,152 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // Per-mint endpoints — best-effort, NOT health-gated. Used by the detail
+  // panel for holders + recent signatures. Cache TTL kept short (15-30s) so
+  // an active token's view stays fresh without hammering Solana RPC.
+  const MINT_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+  type HoldersPayload = {
+    supply: { uiAmount: number; decimals: number; amount: string };
+    top: Array<{ address: string; uiAmount: number; pct: number }>;
+    top10Pct: number;
+    fetchedAt: string;
+  };
+  type TradesPayload = {
+    signatures: SignatureEntry[];
+    fetchedAt: string;
+  };
+  const holdersCache = new Map<string, { at: number; value: HoldersPayload }>();
+  const tradesCache = new Map<string, { at: number; value: TradesPayload }>();
+  const HOLDERS_TTL_MS = 30_000;
+  const TRADES_TTL_MS = 15_000;
+
+  app.get("/api/token/:mint/holders", async (req, res) => {
+    const mint = String(req.params.mint || "");
+    if (!MINT_RE.test(mint)) {
+      res.status(400).json({ message: "invalid mint address" });
+      return;
+    }
+    const cached = holdersCache.get(mint);
+    if (cached && Date.now() - cached.at < HOLDERS_TTL_MS) {
+      res.json(cached.value);
+      return;
+    }
+    try {
+      const [largest, supply] = await Promise.all([
+        fetchTokenLargestAccounts(mint),
+        fetchTokenSupply(mint),
+      ]);
+      const supplyUi = supply.uiAmount ?? 0;
+      const top = (largest as LargestAccountEntry[]).slice(0, 20).map((entry) => {
+        const ui = entry.uiAmount ?? 0;
+        const pct = supplyUi > 0 ? (ui / supplyUi) * 100 : 0;
+        return { address: entry.address, uiAmount: ui, pct };
+      });
+      const top10Pct = top.slice(0, 10).reduce((sum, h) => sum + h.pct, 0);
+      const payload: HoldersPayload = {
+        supply: { uiAmount: supplyUi, decimals: supply.decimals, amount: supply.amount },
+        top,
+        top10Pct,
+        fetchedAt: new Date().toISOString(),
+      };
+      holdersCache.set(mint, { at: Date.now(), value: payload });
+      res.json(payload);
+    } catch (error) {
+      if (isRpcNotConfigured(error)) {
+        res.status(503).json({ message: "Solana RPC not configured (SVS_RPC_HTTP_URL)" });
+        return;
+      }
+      res.status(502).json({
+        message: error instanceof Error ? error.message : "holders fetch failed",
+      });
+    }
+  });
+
+  app.get("/api/token/:mint/trades", async (req, res) => {
+    const mint = String(req.params.mint || "");
+    if (!MINT_RE.test(mint)) {
+      res.status(400).json({ message: "invalid mint address" });
+      return;
+    }
+    const cached = tradesCache.get(mint);
+    if (cached && Date.now() - cached.at < TRADES_TTL_MS) {
+      res.json(cached.value);
+      return;
+    }
+    try {
+      const signatures = await fetchSignaturesForAddress(mint, 30);
+      const payload: TradesPayload = {
+        signatures,
+        fetchedAt: new Date().toISOString(),
+      };
+      tradesCache.set(mint, { at: Date.now(), value: payload });
+      res.json(payload);
+    } catch (error) {
+      if (isRpcNotConfigured(error)) {
+        res.status(503).json({ message: "Solana RPC not configured (SVS_RPC_HTTP_URL)" });
+        return;
+      }
+      res.status(502).json({
+        message: error instanceof Error ? error.message : "trades fetch failed",
+      });
+    }
+  });
+
+  app.get("/api/raw/recent", (req, res) => {
+    const limit = Math.max(1, Math.min(Number(req.query.limit ?? 200) || 200, 500));
+    try {
+      res.json(feedRecent(limit));
+    } catch (error) {
+      res.status(500).json({
+        message: error instanceof Error ? error.message : "feed recent failed",
+      });
+    }
+  });
+
+  app.get("/api/raw/stream", (_req, res) => {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    });
+
+    let closed = false;
+    const write = (event: unknown) => {
+      if (closed) return;
+      try {
+        res.write(`event: feed\n`);
+        res.write(`data: ${JSON.stringify(event)}\n\n`);
+      } catch {
+        // ignore — client likely disconnected
+      }
+    };
+    // Replay backlog newest-first so the page has immediate content.
+    for (const event of feedRecent(200)) write(event);
+
+    const unsubscribe = feedSubscribe((event) => write(event));
+    const heartbeat = setInterval(() => {
+      if (closed) return;
+      try {
+        res.write(`: ping ${Date.now()}\n\n`);
+      } catch {
+        // ignore
+      }
+    }, 15_000);
+
+    _req.on("close", () => {
+      closed = true;
+      clearInterval(heartbeat);
+      unsubscribe();
+    });
+  });
+
   app.get("/api/radar", async (req, res) => {
     const force = req.query.force === "1";
     try {
       const snapshot = await buildSnapshotWithDeadline(force);
       res.json(snapshot);
     } catch (error) {
-      const latest = await storage.getLatestRadarSnapshot().catch(() => undefined);
-      if (latest) {
-        try {
-          const snapshot = JSON.parse(latest.payload) as RadarSnapshot;
-          snapshot.sourceHealth.unshift({ name: "cache", status: "degraded", detail: "serving last saved snapshot" });
-          return res.json(snapshot);
-        } catch {
-          // fall through
-        }
-      }
+      // Fail loudly — never serve a stale "last saved" snapshot.
       res.status(502).json({ message: error instanceof Error ? error.message : "scanner failed" });
     }
   });
@@ -949,15 +1178,22 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
 
     let closed = false;
+    let sending = false;
     const send = async () => {
-      if (closed) return;
+      if (closed || sending) return;
+      sending = true;
       try {
-        const snapshot = await buildSnapshot(true);
+        const snapshot = await buildSnapshotWithDeadline(true);
+        if (closed) return;
         res.write(`event: radar\n`);
         res.write(`data: ${JSON.stringify(snapshot)}\n\n`);
       } catch (error) {
-        res.write(`event: error\n`);
-        res.write(`data: ${JSON.stringify({ message: error instanceof Error ? error.message : "scanner failed" })}\n\n`);
+        if (!closed) {
+          res.write(`event: error\n`);
+          res.write(`data: ${JSON.stringify({ message: error instanceof Error ? error.message : "scanner failed" })}\n\n`);
+        }
+      } finally {
+        sending = false;
       }
     };
 
