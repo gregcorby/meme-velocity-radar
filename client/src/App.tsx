@@ -8,7 +8,6 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import NotFound from "@/pages/not-found";
 import RawFeedPage from "@/pages/raw-feed";
 import type { RadarSnapshot, TokenSignal } from "@shared/schema";
@@ -1113,16 +1112,31 @@ function RadarHome() {
         </header>
 
         <div className="space-y-3 p-4">
-          <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
-            <Tabs value={sortMode} onValueChange={(value) => setSortMode(value as SortMode)} data-testid="tabs-sort-mode">
-              <TabsList className="flex h-auto flex-wrap justify-start">
-                <TabsTrigger value="score" data-testid="tab-sort-score">Score</TabsTrigger>
-                <TabsTrigger value="velocity" data-testid="tab-sort-velocity">Velocity</TabsTrigger>
-                <TabsTrigger value="virality" data-testid="tab-sort-virality">Virality</TabsTrigger>
-                <TabsTrigger value="upside" data-testid="tab-sort-upside">Upside</TabsTrigger>
-                <TabsTrigger value="risk" data-testid="tab-sort-risk">Low risk</TabsTrigger>
-              </TabsList>
-            </Tabs>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1" data-testid="tabs-sort-mode">
+            <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">sort by:</span>
+            {([
+              ["score", "Score"],
+              ["velocity", "Velocity"],
+              ["virality", "Virality"],
+              ["upside", "Upside"],
+              ["risk", "Low risk"],
+            ] as Array<[SortMode, string]>).map(([key, label]) => {
+              const isActive = sortMode === key;
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => setSortMode(key)}
+                  className={`font-mono text-[10px] uppercase tracking-wider active:scale-[0.96] ${
+                    isActive ? "text-primary" : "text-muted-foreground/60 hover:text-foreground"
+                  }`}
+                  style={{ transitionProperty: "color, transform", transitionDuration: "120ms" }}
+                  data-testid={`tab-sort-${key}`}
+                >
+                  {label}
+                </button>
+              );
+            })}
           </div>
 
           {error ? (
