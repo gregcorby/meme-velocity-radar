@@ -284,8 +284,8 @@ function TokenAvatar({ token, size = 14 }: { token: TokenSignal; size?: 9 | 10 |
     <img
       src={token.imageUrl}
       alt=""
-      className={`${dim} ${radius} ${outline} shrink-0 object-cover`}
-      crossOrigin="anonymous"
+      referrerPolicy="no-referrer"
+      className={`${dim} ${radius} ${outline} shrink-0 bg-muted object-cover`}
       loading="lazy"
       decoding="async"
       onError={() => setFailed(true)}
