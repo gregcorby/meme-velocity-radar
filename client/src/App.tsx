@@ -154,19 +154,24 @@ function ScorePill({
   drivers: Driver[];
   danger?: boolean;
 }) {
+  // concentric: outer rounded-xl (12) = inner driver row has no radius but padding p-3 (12).
   return (
-    <div className="rounded-2xl border border-border bg-card p-4" data-testid={`score-${label.toLowerCase()}`}>
+    <div className="rounded-xl border border-border/70 bg-card p-3" data-testid={`score-${label.toLowerCase()}`}>
       <div className="flex items-baseline justify-between">
-        <p className="text-[10px] font-medium uppercase tracking-[0.18em] text-muted-foreground">{label}</p>
-        <span className={`font-mono text-2xl font-semibold leading-none tracking-tight ${danger ? riskTone(value) : scoreTone(value)}`}>
+        <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
+        <span
+          className={`font-mono text-xl font-semibold leading-none tabular-nums tracking-tight ${
+            danger ? riskTone(value) : scoreTone(value)
+          }`}
+        >
           {value}
         </span>
       </div>
-      <div className="mt-3 divide-y divide-border/50">
+      <div className="mt-2.5 divide-y divide-border/40">
         {drivers.map((d) => (
-          <div key={d.label} className="flex items-center justify-between py-1.5 first:pt-0 last:pb-0">
-            <span className="text-[10px] uppercase tracking-wider text-muted-foreground">{d.label}</span>
-            <span className="font-mono text-xs text-foreground/85">{d.value}</span>
+          <div key={d.label} className="flex items-center justify-between py-1 first:pt-0 last:pb-0">
+            <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">{d.label}</span>
+            <span className="font-mono text-[11px] tabular-nums text-foreground/85">{d.value}</span>
           </div>
         ))}
       </div>
@@ -250,14 +255,25 @@ function actionReasons(token: TokenSignal): string[] {
   return reasons.slice(0, 4);
 }
 
-function TokenAvatar({ token, size = 14 }: { token: TokenSignal; size?: 12 | 14 | 16 | 20 }) {
+function TokenAvatar({ token, size = 14 }: { token: TokenSignal; size?: 9 | 10 | 12 | 14 | 16 | 20 }) {
   const [failed, setFailed] = useState(false);
   const initials = token.symbol.slice(0, 3).toUpperCase();
-  const dim = { 12: "h-12 w-12", 14: "h-14 w-14", 16: "h-16 w-16", 20: "h-20 w-20" }[size];
+  const dim = {
+    9: "h-9 w-9",
+    10: "h-10 w-10",
+    12: "h-12 w-12",
+    14: "h-14 w-14",
+    16: "h-16 w-16",
+    20: "h-20 w-20",
+  }[size];
+  // image_outline: pure black at 10% in light, pure white at 10% in dark — never a tinted neutral.
+  const outline =
+    "shadow-[inset_0_0_0_1px_rgba(0,0,0,0.1)] dark:shadow-[inset_0_0_0_1px_rgba(255,255,255,0.1)]";
+  const radius = size <= 10 ? "rounded-md" : size <= 14 ? "rounded-lg" : "rounded-xl";
   if (!token.imageUrl || failed) {
     return (
       <div
-        className={`grid ${dim} shrink-0 place-items-center rounded-xl border border-border bg-muted font-mono text-xs font-semibold`}
+        className={`grid ${dim} ${radius} ${outline} shrink-0 place-items-center bg-muted font-mono text-[10px] font-semibold uppercase`}
         data-testid={`avatar-fallback-${token.id}`}
       >
         {initials}
@@ -267,9 +283,11 @@ function TokenAvatar({ token, size = 14 }: { token: TokenSignal; size?: 12 | 14 
   return (
     <img
       src={token.imageUrl}
-      alt={`${token.name} token artwork`}
-      className={`${dim} shrink-0 rounded-xl border border-border object-cover`}
+      alt=""
+      className={`${dim} ${radius} ${outline} shrink-0 object-cover`}
       crossOrigin="anonymous"
+      loading="lazy"
+      decoding="async"
       onError={() => setFailed(true)}
       data-testid={`img-token-${token.id}`}
     />
@@ -327,7 +345,7 @@ function ScamPrompt({
     }
   };
   return (
-    <div className="mt-2 flex items-center gap-2 rounded border border-destructive/40 bg-destructive/5 px-2 py-1.5 font-mono text-[10px]">
+    <div className="flex items-center gap-2 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1 font-mono text-[10px]">
       <span className="truncate text-destructive">
         scam? {token.scamSignals.slice(0, 2).join(", ")}
       </span>
@@ -337,6 +355,7 @@ function ScamPrompt({
           disabled={pending}
           onClick={(e) => submit(true, e)}
           className="h-5 rounded border border-destructive/50 bg-destructive/10 px-2 text-destructive hover:bg-destructive/20 disabled:opacity-50"
+          style={{ transitionProperty: "background-color", transitionDuration: "120ms" }}
           data-testid={`button-scam-yes-${token.id}`}
         >
           yes
@@ -346,6 +365,7 @@ function ScamPrompt({
           disabled={pending}
           onClick={(e) => submit(false, e)}
           className="h-5 rounded border border-border bg-card px-2 text-muted-foreground hover:bg-accent disabled:opacity-50"
+          style={{ transitionProperty: "background-color, color", transitionDuration: "120ms" }}
           data-testid={`button-scam-no-${token.id}`}
         >
           no
@@ -355,10 +375,15 @@ function ScamPrompt({
   );
 }
 
+function verdictDot(verdict: TokenVerdict) {
+  if (verdict === "Investigate") return "bg-primary";
+  if (verdict === "Pass") return "bg-destructive";
+  return "bg-amber-500";
+}
+
 function TokenCard({
   token,
   active,
-  index,
   onSelect,
   votedScam,
   onVotedScam,
@@ -372,64 +397,80 @@ function TokenCard({
 }) {
   const accel = token.volumeAcceleration ?? 0;
   const verdict = tokenVerdict(token);
-  const reasons = actionReasons(token);
   const risk = token.riskFlags[0];
   const dimmed = token.suspectedScam && !votedScam;
+  // concentric radius: outer rounded-xl (12px) = inner rounded (4px) + p-2 (8px).
   return (
-    <button
-      type="button"
-      onClick={() => onSelect(token)}
-      className={`group relative w-full rounded-lg border border-l-4 bg-card p-3 text-left transition hover:border-primary/60 ${
-        active ? "border-primary" : `border-border ${verdictBorder(verdict)}`
-      } ${dimmed ? "opacity-60" : ""}`}
+    <div
+      className={`group relative rounded-xl border bg-card ${
+        active
+          ? "border-primary shadow-[0_0_0_1px_hsl(var(--primary)/0.55)_inset]"
+          : "border-border/70 hover:border-foreground/30"
+      } ${dimmed ? "opacity-50" : ""}`}
+      style={{ transitionProperty: "border-color, box-shadow, opacity", transitionDuration: "160ms" }}
       data-testid={`button-token-${token.id}`}
     >
-      <div className="flex items-center gap-3">
-        <TokenAvatar token={token} size={12} />
-        <div className="min-w-0 flex-1">
-          <div className="grid grid-cols-[minmax(0,1fr)_58px] gap-3">
-            <div className="min-w-0">
-              <div className="flex items-baseline gap-2">
-                <span className="font-mono text-[10px] text-muted-foreground">{String(index + 1).padStart(2, "0")}</span>
-                <span className={`font-mono text-[10px] uppercase tracking-wider ${verdictClass(verdict)}`}>{verdict}</span>
-              </div>
-              <p className="mt-0.5 truncate font-mono text-lg font-semibold uppercase leading-tight" data-testid={`text-token-symbol-${token.id}`}>
-                {token.symbol}
-              </p>
-              <p className="mt-0.5 font-mono text-[10px] text-muted-foreground">{shortAddress(token.tokenAddress)}</p>
-            </div>
-            <div className="text-right">
-              <p className={`font-mono text-2xl font-semibold leading-none ${scoreTone(token.scores.final)}`} data-testid={`text-final-score-${token.id}`}>
-                {token.scores.final}
-              </p>
-              <p className="mt-1 font-mono text-[10px] text-muted-foreground">score</p>
-            </div>
-          </div>
+      <button
+        type="button"
+        onClick={() => onSelect(token)}
+        className="flex w-full items-center gap-2.5 rounded-xl p-2 text-left will-change-transform active:scale-[0.99]"
+        style={{ transitionProperty: "transform", transitionDuration: "120ms" }}
+      >
+        <TokenAvatar token={token} size={10} />
 
-          <div className="mt-3 grid grid-cols-4 gap-2 border-t border-border/60 pt-2 font-mono text-[10px] text-muted-foreground">
-            <div>
-              <p className="text-foreground/90">{fmtMoney(token.marketCap)}</p>
-              <p>cap</p>
-            </div>
-            <div>
-              <p className="text-foreground/90">{fmtMoney(token.liquidityUsd)}</p>
-              <p>liq</p>
-            </div>
-            <div>
-              <p className={accel >= 1.5 ? "text-primary" : "text-foreground/90"}>{fmtMult(accel)}</p>
-              <p>vol</p>
-            </div>
-            <div>
-              <p className="text-foreground/90">{fmtMult(token.txnAcceleration)}</p>
-              <p>tx</p>
-            </div>
+        <div className="grid min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1">
+          {/* Row 1: SYMBOL + verdict dot   |   score */}
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span
+              className="truncate font-mono text-sm font-semibold uppercase leading-none tracking-tight"
+              data-testid={`text-token-symbol-${token.id}`}
+            >
+              {token.symbol}
+            </span>
+            <span
+              aria-hidden="true"
+              className={`h-1.5 w-1.5 shrink-0 rounded-full ${verdictDot(verdict)}`}
+              title={verdict}
+            />
           </div>
-          {risk ? <p className="mt-2 truncate font-body text-xs text-destructive">{risk}</p> : null}
-          {!risk && reasons[0] ? <p className="mt-2 truncate font-body text-xs text-muted-foreground">{reasons.join(" / ")}</p> : null}
+          <span
+            className={`font-mono text-base font-semibold tabular-nums leading-none ${scoreTone(token.scores.final)}`}
+            data-testid={`text-final-score-${token.id}`}
+          >
+            {token.scores.final}
+          </span>
+
+          {/* Row 2: meta stats   |   accel */}
+          <div className="flex min-w-0 items-center gap-1.5 font-mono text-[10px] leading-none text-muted-foreground tabular-nums">
+            <span className="truncate text-foreground/75">{fmtMoney(token.marketCap)}</span>
+            <span aria-hidden="true" className="opacity-40">·</span>
+            <span className="truncate">{fmtMoney(token.liquidityUsd)}</span>
+            <span aria-hidden="true" className="opacity-40">·</span>
+            <span className="truncate">{fmtAge(token.pairAgeMinutes)}</span>
+            {risk ? (
+              <>
+                <span aria-hidden="true" className="opacity-40">·</span>
+                <span className="truncate text-destructive">{risk}</span>
+              </>
+            ) : null}
+          </div>
+          <span
+            className={`shrink-0 font-mono text-[10px] leading-none tabular-nums ${
+              accel >= 1.5 ? "text-primary" : "text-muted-foreground"
+            }`}
+            title={`vol ${fmtMult(accel)} · tx ${fmtMult(token.txnAcceleration)}`}
+          >
+            {fmtMult(accel)}↑
+          </span>
+        </div>
+      </button>
+
+      {token.suspectedScam && !votedScam ? (
+        <div className="px-2 pb-2">
           <ScamPrompt token={token} voted={votedScam} onVoted={onVotedScam} />
         </div>
-      </div>
-    </button>
+      ) : null}
+    </div>
   );
 }
 
@@ -450,39 +491,40 @@ function relTime(blockTime: number | null) {
 function HoldersCard({ data, error, loading }: { data: HoldersResponse | undefined; error: unknown; loading: boolean }) {
   const concentrated = (data?.top10Pct ?? 0) > 50;
   return (
-    <div className="rounded-2xl border border-border bg-background p-5">
-      <div className="mb-3 flex items-center justify-between">
-        <p className="text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground">Top holders</p>
+    <div className="rounded-xl border border-border/70 bg-background p-3">
+      <div className="mb-2 flex items-center justify-between">
+        <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Top holders</p>
         {data ? (
-          <span className={`font-mono text-[10px] uppercase tracking-wider ${concentrated ? "text-destructive" : "text-muted-foreground"}`}>
+          <span className={`font-mono text-[10px] tabular-nums uppercase tracking-wider ${concentrated ? "text-destructive" : "text-muted-foreground"}`}>
             top10 {data.top10Pct.toFixed(1)}%
           </span>
         ) : null}
       </div>
       {loading && !data ? (
-        <div className="space-y-2">{Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="h-6 rounded" />)}</div>
+        <div className="space-y-1.5">{Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="h-5 rounded" />)}</div>
       ) : error ? (
-        <p className="font-body text-xs text-muted-foreground">Holder data unavailable.</p>
+        <p className="font-mono text-[11px] text-muted-foreground">Holder data unavailable.</p>
       ) : !data?.top.length ? (
-        <p className="font-body text-xs text-muted-foreground">No holder data returned.</p>
+        <p className="font-mono text-[11px] text-muted-foreground">No holder data returned.</p>
       ) : (
-        <div className="divide-y divide-border/50">
+        <div className="divide-y divide-border/40">
           {data.top.slice(0, 10).map((h, i) => (
-            <div key={h.address} className="flex items-center gap-3 py-2 first:pt-0 last:pb-0" data-testid={`holder-${i}`}>
-              <span className="w-6 font-mono text-[10px] tracking-[0.18em] text-muted-foreground">{String(i + 1).padStart(2, "0")}</span>
+            <div key={h.address} className="flex items-center gap-2 py-1.5 first:pt-0 last:pb-0" data-testid={`holder-${i}`}>
+              <span className="w-5 font-mono text-[10px] tabular-nums text-muted-foreground">{String(i + 1).padStart(2, "0")}</span>
               <a
                 href={`https://solscan.io/account/${h.address}`}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="font-mono text-xs text-foreground/80 hover:text-primary"
+                className="font-mono text-[11px] tabular-nums text-foreground/80 hover:text-primary"
+                style={{ transitionProperty: "color", transitionDuration: "120ms" }}
               >
                 {shortAddress(h.address)}
               </a>
               <div className="ml-auto flex items-center gap-2">
-                <div className="hidden h-1.5 w-20 overflow-hidden rounded-full bg-muted sm:block">
+                <div className="hidden h-1 w-20 overflow-hidden rounded-full bg-muted sm:block">
                   <div className="h-full rounded-full bg-primary" style={{ width: `${Math.min(100, h.pct)}%` }} />
                 </div>
-                <span className="font-mono text-xs tabular-nums">{h.pct.toFixed(2)}%</span>
+                <span className="w-12 text-right font-mono text-[11px] tabular-nums">{h.pct.toFixed(2)}%</span>
               </div>
             </div>
           ))}
@@ -494,31 +536,32 @@ function HoldersCard({ data, error, loading }: { data: HoldersResponse | undefin
 
 function TradesCard({ data, error, loading }: { data: TradesResponse | undefined; error: unknown; loading: boolean }) {
   return (
-    <div className="rounded-2xl border border-border bg-background p-5">
-      <div className="mb-3 flex items-center justify-between">
-        <p className="text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground">Recent activity</p>
+    <div className="rounded-xl border border-border/70 bg-background p-3">
+      <div className="mb-2 flex items-center justify-between">
+        <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Recent activity</p>
         <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">signatures</span>
       </div>
       {loading && !data ? (
-        <div className="space-y-2">{Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="h-6 rounded" />)}</div>
+        <div className="space-y-1.5">{Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="h-5 rounded" />)}</div>
       ) : error ? (
-        <p className="font-body text-xs text-muted-foreground">Trade data unavailable.</p>
+        <p className="font-mono text-[11px] text-muted-foreground">Trade data unavailable.</p>
       ) : !data?.signatures.length ? (
-        <p className="font-body text-xs text-muted-foreground">No recent signatures.</p>
+        <p className="font-mono text-[11px] text-muted-foreground">No recent signatures.</p>
       ) : (
-        <div className="divide-y divide-border/50">
+        <div className="divide-y divide-border/40">
           {data.signatures.slice(0, 15).map((tx) => (
             <a
               key={tx.signature}
               href={`https://solscan.io/tx/${tx.signature}`}
               target="_blank"
               rel="noopener noreferrer"
-              className="flex items-center gap-3 py-2 hover:text-primary"
+              className="flex items-center gap-2 py-1.5 hover:text-primary"
+              style={{ transitionProperty: "color", transitionDuration: "120ms" }}
               data-testid={`trade-${tx.signature.slice(0, 8)}`}
             >
               <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${tx.err ? "bg-destructive" : "bg-primary"}`} aria-hidden="true" />
-              <span className="font-mono text-xs text-foreground/80">{shortAddress(tx.signature)}</span>
-              <span className="ml-auto font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+              <span className="font-mono text-[11px] tabular-nums text-foreground/80">{shortAddress(tx.signature)}</span>
+              <span className="ml-auto font-mono text-[10px] tabular-nums uppercase tracking-wider text-muted-foreground">
                 {relTime(tx.blockTime)}
               </span>
             </a>
@@ -567,32 +610,40 @@ function DetailPanel({
   const risk = token.riskFlags[0] ?? token.dangerNote;
 
   return (
-    <section className="flex h-full min-h-0 flex-col rounded-xl border border-border bg-card" data-testid={`detail-panel-${token.id}`}>
-      <div className="border-b border-border p-4">
-        <div className="flex items-start justify-between gap-4">
-          <div className="flex min-w-0 items-start gap-4">
-            <TokenAvatar token={token} size={16} />
+    <section className="flex h-full min-h-0 flex-col rounded-xl border border-border/70 bg-card" data-testid={`detail-panel-${token.id}`}>
+      <div className="border-b border-border/70 p-3.5">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-3">
+            <TokenAvatar token={token} size={12} />
             <div className="min-w-0">
-              <p className="font-mono text-2xl font-semibold uppercase leading-tight tracking-tight" data-testid="text-selected-token">
-                {token.symbol}
+              <div className="flex items-center gap-2">
+                <p className="font-mono text-xl font-semibold uppercase leading-none tracking-tight" data-testid="text-selected-token">
+                  {token.symbol}
+                </p>
+                <span aria-hidden="true" className={`h-1.5 w-1.5 rounded-full ${verdictDot(verdict)}`} />
+                <span className={`font-mono text-[10px] uppercase tracking-wider ${verdictClass(verdict)}`}>{verdict}</span>
+              </div>
+              <p className="mt-1 truncate font-mono text-[11px] tabular-nums text-muted-foreground">
+                {token.tokenAddress}
               </p>
-              <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{token.tokenAddress}</p>
-              <p className={`mt-2 font-mono text-xs uppercase tracking-wider ${verdictClass(verdict)}`}>{verdict}</p>
             </div>
           </div>
           <div className="text-right">
-            <p className={`mt-1 font-mono text-5xl font-semibold leading-none tracking-tight ${scoreTone(token.scores.final)}`} data-testid="text-selected-score">
+            <p
+              className={`font-mono text-4xl font-semibold leading-none tabular-nums tracking-tight ${scoreTone(token.scores.final)}`}
+              data-testid="text-selected-score"
+            >
               {token.scores.final}
             </p>
-            <p className="mt-1 font-mono text-[10px] text-muted-foreground">score</p>
+            <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">score</p>
           </div>
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-4">
+      <div className="min-h-0 flex-1 overflow-y-auto p-3.5">
         <div>
           {chartUrl ? (
-            <div className="overflow-hidden rounded-2xl border border-border bg-background">
+            <div className="overflow-hidden rounded-xl border border-border/70 bg-background">
               <iframe
                 src={chartUrl}
                 title={`${token.symbol} chart`}
@@ -602,47 +653,45 @@ function DetailPanel({
               />
             </div>
           ) : (
-            <div className="rounded-2xl border border-border bg-background p-8 text-center" data-testid="chart-no-pair">
-              <p className="text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground">pair not indexed</p>
-              <p className="mt-2 font-body text-sm text-muted-foreground">
-                Holders and signatures may still be available.
-              </p>
+            <div className="rounded-xl border border-border/70 bg-background p-6 text-center" data-testid="chart-no-pair">
+              <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">pair not indexed</p>
+              <p className="mt-1.5 font-body text-xs text-muted-foreground">Holders and signatures may still be available.</p>
             </div>
           )}
         </div>
 
-        <div className="mt-5 grid gap-3 md:grid-cols-3">
-          <div className="rounded-lg border border-border bg-background p-3">
-            <p className="font-mono text-lg font-semibold">{reasons.length ? reasons.join(" / ") : "No strong driver"}</p>
-            <p className="mt-1 font-mono text-[10px] text-muted-foreground">drivers</p>
+        <div className="mt-3 grid gap-2 md:grid-cols-3">
+          <div className="rounded-lg border border-border/70 bg-background p-2.5">
+            <p className="truncate font-mono text-sm font-semibold tabular-nums">{reasons.length ? reasons.join(" / ") : "—"}</p>
+            <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">drivers</p>
           </div>
-          <div className="rounded-lg border border-border bg-background p-3">
-            <p className="font-mono text-lg font-semibold">{risk}</p>
-            <p className="mt-1 font-mono text-[10px] text-muted-foreground">risk</p>
+          <div className="rounded-lg border border-border/70 bg-background p-2.5">
+            <p className="truncate font-mono text-sm font-semibold text-destructive">{risk || "—"}</p>
+            <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">risk</p>
           </div>
-          <div className="rounded-lg border border-border bg-background p-3">
-            <p className="font-mono text-lg font-semibold">{fmtAge(token.pairAgeMinutes)}</p>
-            <p className="mt-1 font-mono text-[10px] text-muted-foreground">age</p>
+          <div className="rounded-lg border border-border/70 bg-background p-2.5">
+            <p className="font-mono text-sm font-semibold tabular-nums">{fmtAge(token.pairAgeMinutes)}</p>
+            <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">age</p>
           </div>
         </div>
 
-        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-4">
           <ScorePill label="Velocity" value={token.scores.velocity} drivers={velocityDrivers(token)} />
           <ScorePill label="Virality" value={token.scores.virality} drivers={viralityDrivers(token)} />
           <ScorePill label="Upside" value={token.scores.upside} drivers={upsideDrivers(token)} />
           <ScorePill label="Risk" value={token.scores.risk} drivers={riskDrivers(token)} danger />
         </div>
 
-        <div className="mt-5 grid gap-4 xl:grid-cols-2">
+        <div className="mt-3 grid gap-3 xl:grid-cols-2">
           <HoldersCard data={holders} error={holdersError} loading={holdersLoading} />
           <TradesCard data={trades} error={tradesError} loading={tradesLoading} />
         </div>
 
-        <div className="mt-5 flex flex-wrap gap-2">
+        <div className="mt-3 flex flex-wrap gap-2">
           {token.url ? (
             <Button asChild variant="default" size="sm" data-testid="link-open-dexscreener">
               <a href={token.url} target="_blank" rel="noopener noreferrer">
-                DexScreener <ExternalLink className="ml-2 h-3.5 w-3.5" />
+                DexScreener <ExternalLink className="ml-1.5 h-3.5 w-3.5" />
               </a>
             </Button>
           ) : null}
@@ -652,7 +701,7 @@ function DetailPanel({
             onClick={() => navigator.clipboard?.writeText(token.tokenAddress)}
             data-testid="button-copy-address"
           >
-            Copy mint <Copy className="ml-2 h-3.5 w-3.5" />
+            Copy mint <Copy className="ml-1.5 h-3.5 w-3.5" />
           </Button>
         </div>
       </div>
@@ -662,31 +711,31 @@ function DetailPanel({
 
 function MetaRail({ snapshot }: { snapshot: RadarSnapshot | undefined }) {
   return (
-    <aside className="rounded-lg border border-border bg-card p-4" data-testid="meta-rail">
-      <div className="mb-3 flex items-center justify-between">
-        <p className="text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground">metas</p>
+    <aside className="rounded-lg border border-border/70 bg-card p-3" data-testid="meta-rail">
+      <div className="mb-2 flex items-center justify-between">
+        <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">metas</p>
       </div>
-      <div className="divide-y divide-border/60">
+      <div className="divide-y divide-border/40">
         {snapshot?.metas?.length ? snapshot.metas.slice(0, 6).map((meta, i) => {
           const change = meta.marketCapChange.h1 ?? 0;
           const positive = change >= 0;
           return (
-            <div key={meta.slug} className="py-3 first:pt-0 last:pb-0" data-testid={`card-meta-${meta.slug}`}>
-              <div className="flex items-center justify-between gap-3">
-                <div className="flex min-w-0 items-center gap-3">
-                  <span className="font-mono text-[10px] tracking-[0.2em] text-muted-foreground">
+            <div key={meta.slug} className="py-2 first:pt-0 last:pb-0" data-testid={`card-meta-${meta.slug}`}>
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="font-mono text-[10px] tabular-nums text-muted-foreground">
                     {String(i + 1).padStart(2, "0")}
                   </span>
-                  <p className="truncate text-sm font-medium">{meta.name}</p>
+                  <p className="truncate text-xs font-medium">{meta.name}</p>
                 </div>
-                <span className={`flex items-center gap-0.5 font-mono text-xs ${positive ? "text-emerald-400" : "text-red-400"}`}>
+                <span className={`flex items-center gap-0.5 font-mono text-[11px] tabular-nums ${positive ? "text-emerald-400" : "text-red-400"}`}>
                   {trendIcon(change)}
                   {fmtPct(change)}
                 </span>
               </div>
             </div>
           );
-        }) : Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="my-3 h-12 rounded-lg" />)}
+        }) : Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="my-2 h-9 rounded-md" />)}
       </div>
     </aside>
   );
@@ -1001,8 +1050,8 @@ function RadarHome() {
           </a>
         </div>
 
-        <div className="space-y-2">
-          <p className="px-2 text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">filters</p>
+        <div className="space-y-1">
+          <p className="px-2 pb-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">filters</p>
           {[
             ["all", "All"],
             ["turbo", "Moving"],
@@ -1014,9 +1063,12 @@ function RadarHome() {
               key={key as string}
               type="button"
               onClick={() => setFilterMode(key as FilterMode)}
-              className={`flex w-full items-center rounded-lg px-3 py-2 text-sm transition ${
-                filterMode === key ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-accent hover:text-foreground"
+              className={`flex min-h-[36px] w-full items-center rounded-md px-3 text-sm active:scale-[0.98] ${
+                filterMode === key
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-accent hover:text-foreground"
               }`}
+              style={{ transitionProperty: "background-color, color, transform", transitionDuration: "120ms" }}
               data-testid={`button-filter-${key}`}
             >
               {label as string}
@@ -1030,37 +1082,38 @@ function RadarHome() {
       </aside>
 
       <main className="main-panel">
-        <header className="sticky top-0 z-10 border-b border-border bg-background/92 px-4 py-3 backdrop-blur">
-          <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+        <header className="sticky top-0 z-10 border-b border-border bg-background/92 px-4 py-2.5 backdrop-blur">
+          <div className="flex flex-col gap-2 xl:flex-row xl:items-center xl:justify-between">
             <div className="flex flex-col gap-2 sm:flex-row">
               <div className="relative">
-                <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
                 <input
                   value={search}
                   onChange={(event) => setSearch(event.target.value)}
-                  placeholder="Search ticker or mint"
-                  className="h-10 w-full rounded-lg border border-input bg-card pl-9 pr-3 text-sm outline-none focus:ring-2 focus:ring-ring sm:w-72"
+                  placeholder="ticker or mint"
+                  className="h-9 w-full rounded-md border border-input bg-card pl-8 pr-3 font-mono text-xs outline-none focus:ring-2 focus:ring-ring sm:w-72"
                   data-testid="input-search"
                 />
               </div>
-              <Button variant="outline" onClick={() => exportCsv(visibleTokens)} data-testid="button-export-csv">
-                <Download className="mr-2 h-4 w-4" /> CSV
+              <Button variant="outline" size="sm" onClick={() => exportCsv(visibleTokens)} data-testid="button-export-csv">
+                <Download className="mr-1.5 h-3.5 w-3.5" /> CSV
               </Button>
               <Button
                 variant="outline"
-                size="icon"
+                size="sm"
+                className="h-9 w-9 p-0"
                 onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
                 aria-label="Toggle theme"
                 data-testid="button-toggle-theme"
               >
-                {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+                {theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
               </Button>
             </div>
           </div>
         </header>
 
-        <div className="space-y-4 p-4">
-          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div className="space-y-3 p-4">
+          <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
             <Tabs value={sortMode} onValueChange={(value) => setSortMode(value as SortMode)} data-testid="tabs-sort-mode">
               <TabsList className="flex h-auto flex-wrap justify-start">
                 <TabsTrigger value="score" data-testid="tab-sort-score">Score</TabsTrigger>
@@ -1085,13 +1138,13 @@ function RadarHome() {
           ) : null}
 
           {isLoading && !snapshot ? (
-            <div className="grid gap-5 xl:grid-cols-[420px_1fr]">
-              <div className="space-y-3">{Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-36 rounded-xl" />)}</div>
+            <div className="grid gap-4 xl:grid-cols-[360px_1fr]">
+              <div className="space-y-1.5">{Array.from({ length: 10 }).map((_, i) => <Skeleton key={i} className="h-[58px] rounded-xl" />)}</div>
               <Skeleton className="min-h-[560px] rounded-xl" />
             </div>
           ) : (
-            <div className="grid min-h-[640px] gap-4 xl:grid-cols-[390px_1fr]">
-              <section className="min-h-0 space-y-2 xl:max-h-[calc(100dvh-220px)] xl:overflow-y-auto xl:pr-1" data-testid="token-list">
+            <div className="grid min-h-[640px] gap-4 xl:grid-cols-[360px_1fr]">
+              <section className="min-h-0 space-y-1.5 xl:max-h-[calc(100dvh-200px)] xl:overflow-y-auto xl:pr-1" data-testid="token-list">
                 {visibleTokens.length ? visibleTokens.map((token, idx) => (
                   <TokenCard
                     key={token.id}

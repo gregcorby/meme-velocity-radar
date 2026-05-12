@@ -152,9 +152,20 @@
     @apply bg-background font-sans text-foreground antialiased;
     overflow: hidden;
     width: 100%;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
     font-feature-settings:
       "kern" 1,
       "ss01" 1;
+    text-rendering: optimizeLegibility;
+  }
+
+  h1, h2, h3, h4 {
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
   }
 
   #root {
@@ -172,7 +183,7 @@
 @layer components {
   .dashboard-shell {
     display: grid;
-    grid-template-columns: 280px minmax(0, 1fr);
+    grid-template-columns: 224px minmax(0, 1fr);
     height: 100dvh;
     overflow: hidden;
   }
@@ -182,8 +193,8 @@
     overscroll-behavior: contain;
     border-right: 1px solid hsl(var(--border));
     background: hsl(var(--sidebar));
-    padding: 1rem;
-    padding-bottom: 2.25rem;
+    padding: 0.75rem;
+    padding-bottom: 2rem;
   }
 
   .main-panel {
