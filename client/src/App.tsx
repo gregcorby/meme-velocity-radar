@@ -601,8 +601,9 @@ function DetailPanel({
     );
   }
 
+  // Chart-only embed: hide info panel, trades table, header, and chart-side trades.
   const chartUrl = token.pairAddress
-    ? `https://dexscreener.com/solana/${token.pairAddress}?embed=1&theme=dark&info=0`
+    ? `https://dexscreener.com/solana/${token.pairAddress}?embed=1&theme=dark&info=0&trades=0&header=0&chartLeftToolbar=0&chartTheme=dark&chartType=usd`
     : null;
   const verdict = tokenVerdict(token);
   const reasons = actionReasons(token);
@@ -646,7 +647,8 @@ function DetailPanel({
               <iframe
                 src={chartUrl}
                 title={`${token.symbol} chart`}
-                className="block h-[420px] w-full border-0"
+                className="block w-full border-0"
+                style={{ height: "70vh" }}
                 loading="lazy"
                 data-testid="iframe-chart"
               />
@@ -851,66 +853,6 @@ function exportCsv(tokens: TokenSignal[]) {
   URL.revokeObjectURL(url);
 }
 
-function BrokenScreen({
-  snapshot,
-  onRetry,
-  retrying,
-}: {
-  snapshot: RadarSnapshot | undefined;
-  onRetry: () => void;
-  retrying: boolean;
-}) {
-  const sources = snapshot?.brokenSources ?? [];
-  return (
-    <div className="min-h-screen bg-background" data-testid="broken-screen">
-      <div className="mx-auto max-w-2xl px-6 py-16">
-        <div className="mb-6 flex items-center gap-3">
-          <div className="rounded-lg bg-destructive/10 p-2 text-destructive">
-            <AlertTriangle className="h-6 w-6" />
-          </div>
-          <div>
-            <h1 className="text-xl font-semibold tracking-tight">feed unavailable</h1>
-            <p className="text-sm text-muted-foreground">
-              One or more required upstreams are not delivering.
-            </p>
-          </div>
-        </div>
-        <Card className="border-destructive/30">
-          <CardContent className="p-5">
-            <p className="mb-3 text-xs font-medium uppercase tracking-wider text-muted-foreground">
-              Broken sources ({sources.length})
-            </p>
-            {sources.length ? (
-              <ul className="space-y-2">
-                {sources.map((line, i) => (
-                  <li
-                    key={`${i}-${line}`}
-                    className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 font-mono text-xs"
-                    data-testid={`broken-source-${i}`}
-                  >
-                    {line}
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="text-sm text-muted-foreground">No source detail returned.</p>
-            )}
-            <div className="mt-5 flex flex-wrap gap-2">
-              <Button onClick={onRetry} disabled={retrying} data-testid="button-broken-retry">
-                <RefreshCcw className={`mr-2 h-4 w-4 ${retrying ? "animate-spin" : ""}`} />
-                Retry
-              </Button>
-              <Button variant="outline" asChild data-testid="link-broken-raw">
-                <a href="#/raw">raw</a>
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-    </div>
-  );
-}
-
 function RadarHome() {
   const { theme, setTheme } = useTheme();
   const [live, setLive] = useState(true);
@@ -1031,9 +973,9 @@ function RadarHome() {
     }
   }
 
-  if (snapshot && snapshot.status === "broken") {
-    return <BrokenScreen snapshot={snapshot} onRetry={hardRefresh} retrying={refreshing} />;
-  }
+  // Note: we no longer take the user away from the app on `snapshot.status === "broken"`.
+  // The server now serves cached upstream data on 429s and only marks broken in
+  // a true cold-start zero-data state — handled below by the empty-list UI.
 
   return (
     <div className="dashboard-shell">
