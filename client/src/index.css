@@ -55,7 +55,7 @@
   --shadow-lg: 0 18px 40px -24px hsl(42 21% 10% / 0.28);
   --shadow-xl: 0 24px 60px -32px hsl(42 21% 10% / 0.32);
   --shadow-2xl: 0 30px 80px -36px hsl(42 21% 10% / 0.36);
-  --tracking-normal: -0.01em;
+  --tracking-normal: 0;
   --spacing: 0.25rem;
   --sidebar-primary-border: hsl(var(--sidebar-primary));
   --sidebar-primary-border: hsl(from hsl(var(--sidebar-primary)) h s calc(l + var(--opaque-button-border-intensity)) / alpha);
@@ -79,8 +79,6 @@
   --opaque-button-border-intensity: 8;
   --elevate-1: rgba(255, 255, 255, 0.04);
   --elevate-2: rgba(255, 255, 255, 0.08);
-  /* Pure-black canvas, neutral grays, vivid orange accent —
-     matches the reference inspiration set. */
   --background: 0 0% 3%;
   --foreground: 0 0% 96%;
   --border: 0 0% 14%;
@@ -174,7 +172,7 @@
 @layer components {
   .dashboard-shell {
     display: grid;
-    grid-template-columns: 320px minmax(0, 1fr);
+    grid-template-columns: 280px minmax(0, 1fr);
     height: 100dvh;
     overflow: hidden;
   }
@@ -183,10 +181,9 @@
     overflow-y: auto;
     overscroll-behavior: contain;
     border-right: 1px solid hsl(var(--border));
-    background:
-      radial-gradient(circle at 20% 0%, hsl(var(--primary) / 0.08), transparent 28rem),
-      hsl(var(--sidebar));
-    padding: 1.25rem;
+    background: hsl(var(--sidebar));
+    padding: 1rem;
+    padding-bottom: 2.25rem;
   }
 
   .main-panel {
@@ -194,6 +191,23 @@
     overflow-y: auto;
     overscroll-behavior: contain;
     background: hsl(var(--background));
+    padding-bottom: 2rem;
+  }
+
+  .bottom-status-bar {
+    position: fixed;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 50;
+    display: flex;
+    min-height: 1.25rem;
+    align-items: center;
+    justify-content: space-between;
+    border-top: 1px solid hsl(var(--border));
+    background: hsl(var(--background) / 0.96);
+    color: hsl(var(--muted-foreground));
+    backdrop-filter: blur(10px);
   }
 }
 
