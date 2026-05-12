@@ -421,7 +421,32 @@ function scorePair(pair: DexPair, profile?: TokenProfile, svs: SvsEnrichment = {
     (pairAgeMinutes != null && pairAgeMinutes < 10 ? 14 : 0) +
     (boostAmount > 0 && socialCount === 0 ? 12 : 0);
 
-  const final = clamp(upside * 0.54 + velocity * 0.3 + virality * 0.22 - risk * 0.18);
+  // Scam heuristic — surface obvious scam shapes so we can push them to the
+  // bottom of the ranking and collect user yes/no votes on the prompt to
+  // improve the classifier over time. Each signal here is an independently
+  // recognizable scam-shape; flag suspectedScam when ≥2 fire.
+  const scamSignals: string[] = [];
+  const lowerName = `${name} ${symbol}`.toLowerCase();
+  if (/(test|scam|rug|honey|pump|elon|trump|inu|moon|airdrop)\d*$/.test(symbol.toLowerCase())) {
+    scamSignals.push("symbol matches scam-bait pattern");
+  }
+  if (liquidityUsd > 0 && liquidityUsd < 2_000) scamSignals.push("micro liquidity (<$2k)");
+  if (boostAmount > 0 && socialCount === 0 && description.length < 20) {
+    scamSignals.push("boosted with no socials and no description");
+  }
+  if (m5Tx >= 8 && buyPressureM5 > 0.97) scamSignals.push("100% buys (wash-trade shape)");
+  if (m5Tx >= 8 && buyPressureM5 < 0.03) scamSignals.push("100% sells (exit dump)");
+  if (h24Vol > 0 && liquidityUsd > 0 && h24Vol / Math.max(liquidityUsd, 1) > 80) {
+    scamSignals.push("impossible vol/liq ratio");
+  }
+  if (pairAgeMinutes != null && pairAgeMinutes < 5 && boostAmount > 0) {
+    scamSignals.push("fresh pair + immediate boost");
+  }
+  if (/(.)\1{4,}/.test(lowerName)) scamSignals.push("name has repeated-char spam");
+  const suspectedScam = scamSignals.length >= 2;
+  const scamPenalty = suspectedScam ? 35 : scamSignals.length === 1 ? 8 : 0;
+
+  const final = clamp(upside * 0.54 + velocity * 0.3 + virality * 0.22 - risk * 0.18 - scamPenalty);
   const scoreValues = {
     velocity: Math.round(clamp(velocity)),
     virality: Math.round(clamp(virality)),
@@ -478,6 +503,8 @@ function scorePair(pair: DexPair, profile?: TokenProfile, svs: SvsEnrichment = {
     links,
     riskFlags,
     opportunityFlags,
+    scamSignals,
+    suspectedScam,
     scores: scoreValues,
   };
 }
@@ -573,6 +600,8 @@ function buildGrpcOnlyToken(
     links,
     riskFlags,
     opportunityFlags,
+    scamSignals: [],
+    suspectedScam: false,
     scores: {
       velocity: Math.round(velocity),
       virality: Math.round(virality),
@@ -809,8 +838,12 @@ async function buildSnapshot(force = false): Promise<RadarSnapshot> {
     tokens.push(buildGrpcOnlyToken(candidate, meta, price));
   }
 
+  // Sort by final score descending. We no longer hard-cap the list — every
+  // candidate the pipeline surfaced is included; suspected-scam tokens are
+  // pushed to the bottom via the score penalty (see scamSignals/scamPenalty
+  // in scorePair). Cap at 100 only as a payload safety net for SSE/JSON size.
   tokens.sort((a, b) => b.scores.final - a.scores.final);
-  tokens.splice(24);
+  if (tokens.length > 100) tokens.length = 100;
 
   // Optional mint_info enrichment for the top short-list. Concurrency-limited
   // and tolerant: if it fails, we keep the snapshot we already have.
@@ -1141,6 +1174,48 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       res.status(502).json({
         message: error instanceof Error ? error.message : "trades fetch failed",
+      });
+    }
+  });
+
+  // Scam vote collection — users tap yes/no on suspected-scam tokens. Votes
+  // are appended to a JSONL file so we can train a better classifier later.
+  // No native deps (better-sqlite3 has been flaky on newer Node); the file
+  // is append-only so concurrent writes are safe enough for our volume.
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const dataDir = path.resolve(process.cwd(), "data");
+  const votesFile = path.join(dataDir, "scam-votes.jsonl");
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+  } catch {
+    // ignore — best-effort
+  }
+  app.post("/api/scam-vote", (req, res) => {
+    const body = (req.body ?? {}) as { mint?: unknown; isScam?: unknown; signals?: unknown };
+    const mint = typeof body.mint === "string" ? body.mint : "";
+    const isScam = typeof body.isScam === "boolean" ? body.isScam : null;
+    if (!MINT_RE.test(mint) || isScam === null) {
+      res.status(400).json({ message: "expect { mint: string, isScam: boolean }" });
+      return;
+    }
+    const signals = Array.isArray(body.signals)
+      ? (body.signals as unknown[]).filter((s): s is string => typeof s === "string").slice(0, 20)
+      : [];
+    const record = {
+      mint,
+      isScam,
+      signals,
+      ts: new Date().toISOString(),
+      ip: (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.socket.remoteAddress || null,
+      ua: (req.headers["user-agent"] as string)?.slice(0, 200) ?? null,
+    };
+    try {
+      fs.appendFileSync(votesFile, JSON.stringify(record) + "\n");
+      res.json({ ok: true });
+    } catch (error) {
+      res.status(500).json({
+        message: error instanceof Error ? error.message : "vote write failed",
       });
     }
   });

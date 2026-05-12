@@ -70,6 +70,12 @@ export const tokenSignalSchema = z.object({
   links: z.array(z.object({ type: z.string(), label: z.string().nullable(), url: z.string() })),
   riskFlags: z.array(z.string()),
   opportunityFlags: z.array(z.string()),
+  // Scam heuristic outputs. `scamSignals` lists which patterns fired;
+  // `suspectedScam` is true when ≥2 fire (or one high-confidence one).
+  // Suspected-scam tokens are pushed to the bottom of the ranking via a
+  // score penalty rather than being removed — surface + collect user votes.
+  scamSignals: z.array(z.string()),
+  suspectedScam: z.boolean(),
   scores: scoreBreakdownSchema,
   // Per-protocol decoded event metadata (P1.1). Optional because most
   // tokens come from the DexScreener path or generic gRPC token-balance

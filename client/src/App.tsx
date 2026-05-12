@@ -276,28 +276,112 @@ function TokenAvatar({ token, size = 14 }: { token: TokenSignal; size?: 12 | 14 
   );
 }
 
+const VOTED_SCAMS_KEY = "mvr.votedScams";
+function loadVotedScams(): Set<string> {
+  if (typeof window === "undefined") return new Set();
+  try {
+    const raw = window.localStorage.getItem(VOTED_SCAMS_KEY);
+    return new Set(raw ? (JSON.parse(raw) as string[]) : []);
+  } catch {
+    return new Set();
+  }
+}
+function persistVotedScams(set: Set<string>) {
+  try {
+    window.localStorage.setItem(VOTED_SCAMS_KEY, JSON.stringify(Array.from(set)));
+  } catch {
+    // ignore
+  }
+}
+
+function ScamPrompt({
+  token,
+  voted,
+  onVoted,
+}: {
+  token: TokenSignal;
+  voted: boolean;
+  onVoted: (mint: string) => void;
+}) {
+  const [pending, setPending] = useState(false);
+  if (voted || !token.suspectedScam) return null;
+  const submit = async (isScam: boolean, ev: React.MouseEvent) => {
+    ev.stopPropagation();
+    if (pending) return;
+    setPending(true);
+    try {
+      await fetch("/api/scam-vote", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mint: token.tokenAddress,
+          isScam,
+          signals: token.scamSignals,
+        }),
+      });
+    } catch {
+      // best-effort — still mark voted so the prompt doesn't pester
+    } finally {
+      onVoted(token.tokenAddress);
+      setPending(false);
+    }
+  };
+  return (
+    <div className="mt-2 flex items-center gap-2 rounded border border-destructive/40 bg-destructive/5 px-2 py-1.5 font-mono text-[10px]">
+      <span className="truncate text-destructive">
+        scam? {token.scamSignals.slice(0, 2).join(", ")}
+      </span>
+      <div className="ml-auto flex gap-1">
+        <button
+          type="button"
+          disabled={pending}
+          onClick={(e) => submit(true, e)}
+          className="h-5 rounded border border-destructive/50 bg-destructive/10 px-2 text-destructive hover:bg-destructive/20 disabled:opacity-50"
+          data-testid={`button-scam-yes-${token.id}`}
+        >
+          yes
+        </button>
+        <button
+          type="button"
+          disabled={pending}
+          onClick={(e) => submit(false, e)}
+          className="h-5 rounded border border-border bg-card px-2 text-muted-foreground hover:bg-accent disabled:opacity-50"
+          data-testid={`button-scam-no-${token.id}`}
+        >
+          no
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function TokenCard({
   token,
   active,
   index,
   onSelect,
+  votedScam,
+  onVotedScam,
 }: {
   token: TokenSignal;
   active: boolean;
   index: number;
   onSelect: (token: TokenSignal) => void;
+  votedScam: boolean;
+  onVotedScam: (mint: string) => void;
 }) {
   const accel = token.volumeAcceleration ?? 0;
   const verdict = tokenVerdict(token);
   const reasons = actionReasons(token);
   const risk = token.riskFlags[0];
+  const dimmed = token.suspectedScam && !votedScam;
   return (
     <button
       type="button"
       onClick={() => onSelect(token)}
       className={`group relative w-full rounded-lg border border-l-4 bg-card p-3 text-left transition hover:border-primary/60 ${
         active ? "border-primary" : `border-border ${verdictBorder(verdict)}`
-      }`}
+      } ${dimmed ? "opacity-60" : ""}`}
       data-testid={`button-token-${token.id}`}
     >
       <div className="flex items-center gap-3">
@@ -342,6 +426,7 @@ function TokenCard({
           </div>
           {risk ? <p className="mt-2 truncate font-body text-xs text-destructive">{risk}</p> : null}
           {!risk && reasons[0] ? <p className="mt-2 truncate font-body text-xs text-muted-foreground">{reasons.join(" / ")}</p> : null}
+          <ScamPrompt token={token} voted={votedScam} onVoted={onVotedScam} />
         </div>
       </div>
     </button>
@@ -785,6 +870,16 @@ function RadarHome() {
   const [filterMode, setFilterMode] = useState<FilterMode>("all");
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [votedScams, setVotedScams] = useState<Set<string>>(() => loadVotedScams());
+  const markScamVoted = (mint: string) => {
+    setVotedScams((prev) => {
+      if (prev.has(mint)) return prev;
+      const next = new Set(prev);
+      next.add(mint);
+      persistVotedScams(next);
+      return next;
+    });
+  };
   const [streamSnapshot, setStreamSnapshot] = useState<RadarSnapshot | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -1004,6 +1099,8 @@ function RadarHome() {
                     index={idx}
                     active={selectedToken?.id === token.id}
                     onSelect={(next) => setSelectedId(next.id)}
+                    votedScam={votedScams.has(token.tokenAddress)}
+                    onVotedScam={markScamVoted}
                   />
                 )) : (
                   <Card className="border-dashed" data-testid="empty-token-list">
