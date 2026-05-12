@@ -321,6 +321,12 @@ function recordEvent() {
   eventsReceived++;
   const now = Date.now();
   eventTimestamps.push(now);
+  // Prune here too — eventsPerMinute() is only called on status queries, so
+  // if status is rarely hit while events stream in heavily, the array grows
+  // unboundedly. Pruning on push keeps it bounded to the 60s window.
+  while (eventTimestamps.length && eventTimestamps[0] < now - EVENTS_WINDOW_MS) {
+    eventTimestamps.shift();
+  }
   lastEventAt = now;
 }
 

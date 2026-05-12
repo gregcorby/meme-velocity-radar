@@ -1034,10 +1034,44 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     signatures: SignatureEntry[];
     fetchedAt: string;
   };
-  const holdersCache = new Map<string, { at: number; value: HoldersPayload }>();
-  const tradesCache = new Map<string, { at: number; value: TradesPayload }>();
+  // Bounded TTL caches — Map without a cap leaks: TTL is only checked on read,
+  // so expired entries for one-off-queried mints stick around forever. Evict
+  // oldest (insertion order) when over MAX, plus periodic sweep on writes.
   const HOLDERS_TTL_MS = 30_000;
   const TRADES_TTL_MS = 15_000;
+  const PER_MINT_CACHE_MAX = 500;
+  const PER_MINT_SWEEP_EVERY = 100;
+  type HoldersEntry = { at: number; value: HoldersPayload };
+  type TradesEntry = { at: number; value: TradesPayload };
+  const holdersCache = new Map<string, HoldersEntry>();
+  const tradesCache = new Map<string, TradesEntry>();
+  function setBounded<V extends { at: number }>(
+    cache: Map<string, V>,
+    key: string,
+    value: V,
+    ttlMs: number,
+    counter: { n: number },
+  ) {
+    if (cache.has(key)) cache.delete(key);
+    cache.set(key, value);
+    counter.n++;
+    if (counter.n >= PER_MINT_SWEEP_EVERY) {
+      counter.n = 0;
+      const now = Date.now();
+      const expired: string[] = [];
+      cache.forEach((v, k) => {
+        if (now - v.at >= ttlMs) expired.push(k);
+      });
+      for (const k of expired) cache.delete(k);
+    }
+    while (cache.size > PER_MINT_CACHE_MAX) {
+      const oldest = cache.keys().next().value;
+      if (!oldest) break;
+      cache.delete(oldest);
+    }
+  }
+  const holdersCounter = { n: 0 };
+  const tradesCounter = { n: 0 };
 
   app.get("/api/token/:mint/holders", async (req, res) => {
     const mint = String(req.params.mint || "");
@@ -1068,7 +1102,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         top10Pct,
         fetchedAt: new Date().toISOString(),
       };
-      holdersCache.set(mint, { at: Date.now(), value: payload });
+      setBounded(holdersCache, mint, { at: Date.now(), value: payload }, HOLDERS_TTL_MS, holdersCounter);
       res.json(payload);
     } catch (error) {
       if (isRpcNotConfigured(error)) {
@@ -1098,7 +1132,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         signatures,
         fetchedAt: new Date().toISOString(),
       };
-      tradesCache.set(mint, { at: Date.now(), value: payload });
+      setBounded(tradesCache, mint, { at: Date.now(), value: payload }, TRADES_TTL_MS, tradesCounter);
       res.json(payload);
     } catch (error) {
       if (isRpcNotConfigured(error)) {

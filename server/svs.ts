@@ -286,11 +286,23 @@ async function postBatch<T extends { mint?: string }>(
 // Per-mint TTL caches. Free SVS tier is 10 r/s; without caches we burn the
 // budget re-fetching the same mints every snapshot cycle (every 20s). Remove
 // or expand TTLs when the SVS plan is upgraded.
+//
+// IMPORTANT (memory): caches MUST cap size + sweep expired entries. Memecoin
+// churn means thousands of unique mints/hr flow through here; without an
+// upper bound the maps grow unboundedly even though each entry has a TTL,
+// because expired entries are only deleted on a same-mint read.
 type CacheEntry<T> = { data: T; expires: number };
+
+const MINT_CACHE_MAX_ENTRIES = 5_000;
+const MINT_CACHE_SWEEP_EVERY = 200; // sweep expired entries every N sets
 
 class MintCache<T> {
   private map = new Map<string, CacheEntry<T>>();
-  constructor(private ttlMs: number) {}
+  private setsSinceSweep = 0;
+  constructor(
+    private ttlMs: number,
+    private maxEntries = MINT_CACHE_MAX_ENTRIES,
+  ) {}
 
   get(mint: string): T | undefined {
     const entry = this.map.get(mint);
@@ -303,7 +315,36 @@ class MintCache<T> {
   }
 
   set(mint: string, data: T): void {
+    // Refresh insertion order so newest writes are most recently inserted —
+    // makes the keys().next() eviction below behave as oldest-first.
+    if (this.map.has(mint)) this.map.delete(mint);
     this.map.set(mint, { data, expires: Date.now() + this.ttlMs });
+
+    this.setsSinceSweep++;
+    if (this.setsSinceSweep >= MINT_CACHE_SWEEP_EVERY) {
+      this.setsSinceSweep = 0;
+      this.sweepExpired();
+    }
+    // Hard size cap — evict oldest until under limit. Map iteration order is
+    // insertion order in JS, so keys().next() gives the oldest entry.
+    while (this.map.size > this.maxEntries) {
+      const oldest = this.map.keys().next().value;
+      if (!oldest) break;
+      this.map.delete(oldest);
+    }
+  }
+
+  private sweepExpired(): void {
+    const now = Date.now();
+    const expired: string[] = [];
+    this.map.forEach((entry, mint) => {
+      if (entry.expires < now) expired.push(mint);
+    });
+    for (const mint of expired) this.map.delete(mint);
+  }
+
+  size(): number {
+    return this.map.size;
   }
 }
 
