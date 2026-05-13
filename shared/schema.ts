@@ -30,6 +30,37 @@ export const scoreBreakdownSchema = z.object({
   final: z.number(),
 });
 
+export const narrativeCategorySchema = z.enum([
+  "ai",
+  "animal",
+  "political",
+  "celebrity",
+  "crypto-culture",
+  "brainrot",
+  "community",
+  "regional",
+  "utility",
+  "gaming",
+  "launchpad",
+  "fresh-ticker",
+]);
+
+export const narrativeLifecycleSchema = z.enum(["seed", "emerging", "hot", "saturated", "unclear"]);
+export const confidenceBandSchema = z.enum(["low", "medium", "high"]);
+
+export const narrativeClassificationSchema = z.object({
+  primary: narrativeCategorySchema,
+  secondary: z.array(narrativeCategorySchema),
+  label: z.string(),
+  summary: z.string(),
+  confidence: z.number().min(0).max(1),
+  confidenceBand: confidenceBandSchema,
+  lifecycle: narrativeLifecycleSchema,
+  signals: z.array(z.string()),
+  evidence: z.array(z.string()),
+  explanation: z.string(),
+});
+
 export const tokenSignalSchema = z.object({
   id: z.string(),
   chainId: z.string(),
@@ -44,6 +75,7 @@ export const tokenSignalSchema = z.object({
   description: z.string(),
   memeType: z.string(),
   memeDecode: z.string(),
+  narrative: narrativeClassificationSchema,
   viralityThesis: z.string(),
   upsideThesis: z.string(),
   dangerNote: z.string(),
