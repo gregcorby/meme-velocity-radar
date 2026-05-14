@@ -85,6 +85,8 @@ const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
 const CANDIDATE_TTL_MS = 45 * 60_000; // 45 minutes
 const CANDIDATE_MAX = 1_000;
+const OBSERVED_PROGRAMS_MAX = 10; // cap per-candidate program list to prevent unbounded growth
+const DIAGNOSTICS_RESET_MS = 5 * 60_000; // reset per-key diagnostic maps every 5 minutes
 
 type WatchProgram = { name: string; programId: string };
 
@@ -183,6 +185,7 @@ function buildFilters(): {
 
 class CandidateStore {
   private map = new Map<string, GrpcCandidate>();
+  private recentCache: GrpcCandidate[] | null = null;
 
   upsert(record: {
     mint: string;
@@ -205,7 +208,10 @@ class CandidateStore {
       existing.slot = record.slot;
       existing.txCount += 1;
       for (const program of record.observedPrograms) {
-        if (!existing.observedPrograms.includes(program)) {
+        if (
+          !existing.observedPrograms.includes(program) &&
+          existing.observedPrograms.length < OBSERVED_PROGRAMS_MAX
+        ) {
           existing.observedPrograms.push(program);
         }
       }
@@ -242,6 +248,7 @@ class CandidateStore {
       launchEvent,
     };
     this.map.set(record.mint, created);
+    this.recentCache = null;
     this.evict();
     return { candidate: created, isNew: true };
   }
@@ -258,13 +265,17 @@ class CandidateStore {
       if (!oldest) break;
       this.map.delete(oldest);
     }
+    if (expired.length) this.recentCache = null;
   }
 
   recent(limit: number): GrpcCandidate[] {
     this.evict();
-    const all = Array.from(this.map.values());
-    all.sort((a, b) => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt));
-    return all.slice(0, limit);
+    if (!this.recentCache) {
+      const all = Array.from(this.map.values());
+      all.sort((a, b) => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt));
+      this.recentCache = all;
+    }
+    return this.recentCache.slice(0, limit);
   }
 
   size() {
@@ -639,8 +650,21 @@ async function runStreamOnce(endpoint: string, token: string | undefined) {
   });
 }
 
+// Resets the per-key diagnostic maps that accumulate unboundedly over time.
+// Called on a fixed interval so memory from high-cardinality program IDs,
+// filter names, or error reasons cannot grow without bound.
+// lastDecodedEvent and the scalar counters (eventsReceived, etc.) are
+// intentionally preserved for overall-health visibility.
+function resetDiagnostics() {
+  for (const key of Object.keys(eventsByProgram)) delete eventsByProgram[key];
+  for (const key of Object.keys(eventsByFilter)) delete eventsByFilter[key];
+  for (const key of Object.keys(ignoredReasonCounts)) delete ignoredReasonCounts[key];
+  for (const key of Object.keys(decodedEventCounts)) delete decodedEventCounts[key];
+}
+
 async function runStreamLoop(endpoint: string, token: string | undefined) {
   let backoff = RECONNECT_BASE_MS;
+  const diagnosticsTimer = setInterval(resetDiagnostics, DIAGNOSTICS_RESET_MS);
   while (!stopRequested) {
     try {
       status = activeStreams ? "connected" : "connecting";
@@ -658,6 +682,7 @@ async function runStreamLoop(endpoint: string, token: string | undefined) {
     await new Promise((r) => setTimeout(r, wait));
     backoff = Math.min(backoff * 2, RECONNECT_MAX_MS);
   }
+  clearInterval(diagnosticsTimer);
   status = stopRequested ? "disabled" : status;
 }
 
