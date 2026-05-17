@@ -24,6 +24,7 @@ import {
   type GrpcCandidate,
 } from "./grpcStream";
 import { emit as emitFeed, recent as feedRecent, subscribe as feedSubscribe } from "./feed";
+import { classifyNarrative, type NarrativeClassifierInput } from "./narrativeClassifier";
 
 type DexLink = { type?: string; label?: string; url?: string };
 type TokenProfile = {
@@ -274,30 +275,9 @@ function firstSentence(text: string) {
   return match?.[1] ?? cleaned.slice(0, 180);
 }
 
-function classifyMeme(name: string, symbol: string, description: string) {
-  const corpus = `${name} ${symbol} ${description}`.toLowerCase();
-  const checks: Array<[RegExp, string, string]> = [
-    [/(pepe|frog|kermit|toad|tepe)/, "Pepe / frog derivative", "A frog-coded remix with built-in recognition from the Pepe family tree."],
-    [/(doge|dog|shib|inu|bonk|wif|puppy|pitbull)/, "Dog coin lineage", "A dog mascot coin using the oldest memecoin reflex: instantly readable animal identity."],
-    [/(cat|michi|kitty|kitten|popcat|meow)/, "Cat mascot", "A cat meme where shareability comes from simple character art and reaction-image potential."],
-    [/(elon|trump|biden|vitalik|cz|tate|kanye|saylor)/, "Personality parody", "A public-figure riff that trades on recognition, controversy, and fast remixability."],
-    [/(ai|grok|robot|agent|openai|claude|deepseek)/, "AI meta", "A token riding the AI narrative rather than a single legacy meme character."],
-    [/(wojak|chad|cope|based|npc|goblin)/, "Crypto-native reaction meme", "A reaction-face or crypto-culture archetype built for timeline jokes."],
-    [/(china|chinese|币|狗|猫|龙|救命)/, "China / language meta", "A language and regional-meme play that can spread through novelty and community in-jokes."],
-    [/(fart|poop|butt|piss|brainrot|retard|idiot)/, "Absurdist brainrot", "Shock-value internet nonsense; easy to repeat, risky to hold."],
-    [/(cto|community takeover)/, "Community takeover", "The meme story is less the character and more the community trying to revive or own it."],
-  ];
-
-  for (const [regex, type, decode] of checks) {
-    if (regex.test(corpus)) return { type, decode };
-  }
-
-  return {
-    type: "Fresh ticker meme",
-    decode: description
-      ? "A newly seeded ticker narrative. The meme has to be inferred from its copy and social links until the community standardizes the joke."
-      : "A very early token with sparse metadata. Treat the meme as unproven until social posts make the joke obvious.",
-  };
+function classifyMeme(input: NarrativeClassifierInput) {
+  const narrative = classifyNarrative(input);
+  return { type: narrative.label, decode: narrative.summary, narrative };
 }
 
 function buildLinks(profile?: TokenProfile, pair?: DexPair) {
@@ -363,7 +343,23 @@ function scorePair(pair: DexPair, profile?: TokenProfile, svs: SvsEnrichment = {
   const links = buildLinks(profile, pair);
   const socialCount = links.filter((link) => ["twitter", "telegram", "discord", "social", "x"].includes(link.type.toLowerCase()) || /x\.com|twitter|t\.me|discord/i.test(link.url)).length;
   const hasProfile = Boolean(description || profile?.icon || pair.info?.imageUrl);
-  const { type: memeType, decode } = classifyMeme(name, symbol, description);
+  const narrativeInput: NarrativeClassifierInput = {
+    name,
+    symbol,
+    description,
+    links,
+    sourceTags: [profile?.amount ? "boosts/latest" : "profiles/latest", pair.dexId ? `${pair.dexId}` : "dex", profile?.cto ? "cto" : ""].filter(Boolean),
+    metrics: {
+      volumeAcceleration,
+      buyPressureH1,
+      marketCap,
+      liquidityUsd,
+      pairAgeMinutes,
+      boostAmount,
+      socialCount,
+    },
+  };
+  const { type: memeType, decode, narrative } = classifyMeme(narrativeInput);
   const story = firstSentence(description);
 
   const velocity =
@@ -475,6 +471,7 @@ function scorePair(pair: DexPair, profile?: TokenProfile, svs: SvsEnrichment = {
     description,
     memeType,
     memeDecode: story ? `${decode} Metadata lead: “${story}”` : decode,
+    narrative,
     viralityThesis,
     upsideThesis,
     dangerNote,
@@ -517,8 +514,6 @@ function buildGrpcOnlyToken(
   const name = safeString(meta?.name) || `grpc:${candidate.mint.slice(0, 4)}…${candidate.mint.slice(-4)}`;
   const symbol = safeString(meta?.symbol) || "???";
   const description = safeString(meta?.description);
-  const { type: memeType, decode } = classifyMeme(name, symbol, description);
-  const story = firstSentence(description);
   const priceUsd = n(price?.latest_price, NaN);
   const m5Vol = n(price?.volume_15min) > 0 ? n(price?.volume_15min) / 3 : n(price?.volume_1min) * 5;
   const h1Vol = n(price?.volume_1h);
@@ -528,6 +523,23 @@ function buildGrpcOnlyToken(
   const sourceTags = Array.from(
     new Set([...candidate.sourceTags, meta ? "svs-metadata" : "", price ? "svs-price" : ""].filter(Boolean)),
   );
+  const narrativeInput: NarrativeClassifierInput = {
+    name,
+    symbol,
+    description,
+    sourceTags,
+    metrics: {
+      volumeAcceleration: 0,
+      buyPressureH1: 0.5,
+      marketCap: null,
+      liquidityUsd: 0,
+      pairAgeMinutes: ageMinutes,
+      boostAmount: 0,
+      socialCount: 0,
+    },
+  };
+  const { type: memeType, decode, narrative } = classifyMeme(narrativeInput);
+  const story = firstSentence(description);
   const opportunityFlags = ["grpc live tx", `grpc source: ${candidate.source}`];
   if (candidate.txCount > 1) opportunityFlags.push(`${candidate.txCount} grpc txs`);
   if (candidate.launchEvent) {
@@ -572,6 +584,7 @@ function buildGrpcOnlyToken(
     memeDecode: story
       ? `${decode} Metadata lead: “${story}”`
       : `${decode} (Surfaced from live gRPC tx on ${candidate.source} before a DEX pair appeared.)`,
+    narrative,
     viralityThesis: description
       ? `Has metadata; ${candidate.txCount} live gRPC tx${candidate.txCount > 1 ? "s" : ""} on ${candidate.source}.`
       : `No metadata yet; only ${candidate.txCount} live gRPC tx${candidate.txCount > 1 ? "s" : ""} on ${candidate.source}.`,
@@ -1051,6 +1064,39 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         message: error instanceof Error ? error.message : "grpc status failed",
       });
     }
+  });
+
+  app.post("/api/narratives/classify", (req, res) => {
+    const body = (req.body ?? {}) as NarrativeClassifierInput;
+    const name = typeof body.name === "string" ? body.name.slice(0, 160) : "";
+    const symbol = typeof body.symbol === "string" ? body.symbol.slice(0, 40) : "";
+    const description = typeof body.description === "string" ? body.description.slice(0, 2_000) : "";
+    const links = Array.isArray(body.links)
+      ? body.links.slice(0, 20).map((link) => ({
+          type: typeof link?.type === "string" ? link.type.slice(0, 60) : null,
+          label: typeof link?.label === "string" ? link.label.slice(0, 100) : null,
+          url: typeof link?.url === "string" ? link.url.slice(0, 500) : null,
+        }))
+      : [];
+    const sourceTags = Array.isArray(body.sourceTags)
+      ? body.sourceTags.filter((tag): tag is string => typeof tag === "string").slice(0, 20)
+      : [];
+
+    if (!name && !symbol && !description && links.length === 0 && sourceTags.length === 0) {
+      res.status(400).json({ message: "expect at least one of name, symbol, description, links, or sourceTags" });
+      return;
+    }
+
+    res.json(
+      classifyNarrative({
+        name,
+        symbol,
+        description,
+        links,
+        sourceTags,
+        metrics: body.metrics,
+      }),
+    );
   });
 
   // Per-mint endpoints — best-effort, NOT health-gated. Used by the detail
